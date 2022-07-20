@@ -19,11 +19,17 @@ StateMachine:
       TaskDefinition: !Ref TaskDefinition
       Partition: !Ref AWS::Partition
       Subnets:
+      {{- if .Network.SubnetIDs}}
+        {{- range $id := .Network.SubnetIDs}}
+        - {{$id}}
+        {{- end}}
+      {{- else}}
         Fn::Join:
           - '","'
           - Fn::Split:
             - ','
             - Fn::ImportValue: !Sub '${AppName}-${EnvName}-{{.Network.SubnetsType}}'
+      {{- end}}
       AssignPublicIp: {{.Network.AssignPublicIP}}
       SecurityGroups:
         Fn::Join:
@@ -39,10 +45,12 @@ StateMachine:
 {{include "state-machine-definition.json" . | indent 6}}      
       
 StateMachineRole:
+  Metadata:
+    'aws:copilot:description': 'An IAM role for a state machine to run ECS tasks in your cluster'
   Type: AWS::IAM::Role
   Properties:
     AssumeRolePolicyDocument:
-      Version: 2012-10-17
+      Version: '2012-10-17'
       Statement:
       - Effect: Allow
         Principal:
@@ -51,6 +59,7 @@ StateMachineRole:
     Policies:
     - PolicyName: StateMachine
       PolicyDocument:
+        Version: '2012-10-17'
         Statement:
         - Effect: Allow
           Action: iam:PassRole

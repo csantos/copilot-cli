@@ -6,7 +6,6 @@ package cli
 import (
 	"errors"
 	"fmt"
-	"github.com/aws/copilot-cli/internal/pkg/template"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/template"
 
 	"github.com/aws/copilot-cli/internal/pkg/docker/dockerengine"
 
@@ -78,7 +78,7 @@ var (
 	taskRunAppPrompt = fmt.Sprintf("In which %s would you like to run this %s?", color.Emphasize("application"), color.Emphasize("task"))
 	taskRunEnvPrompt = fmt.Sprintf("In which %s would you like to run this %s?", color.Emphasize("environment"), color.Emphasize("task"))
 
-	taskRunAppPromptHelp = fmt.Sprintf(`Task will be deployed to the selected application. 
+	taskRunAppPromptHelp = fmt.Sprintf(`Task will be deployed to the selected application.
 Select %s to run the task in your default VPC instead of any existing application.`, color.Emphasize(appEnvOptionNone))
 	taskRunEnvPromptHelp = fmt.Sprintf(`Task will be deployed to the selected environment.
 Select %s to run the task in your default VPC instead of any existing environment.`, color.Emphasize(appEnvOptionNone))
@@ -184,7 +184,7 @@ func newTaskRunOpts(vars runTaskVars) (*runTaskOpts, error) {
 		fs:                    &afero.Afero{Fs: afero.NewOsFs()},
 		store:                 store,
 		prompt:                prompter,
-		sel:                   selector.NewSelect(prompter, store),
+		sel:                   selector.NewAppEnvSelector(prompter, store),
 		spinner:               termprogress.NewSpinner(log.DiagnosticWriter),
 		provider:              sessProvider,
 		secretsManagerSecrets: make(map[string]string),
@@ -249,6 +249,7 @@ func (o *runTaskOpts) configureRunner() (taskRunner, error) {
 			return nil, fmt.Errorf("create describer for environment %s in application %s: %w", o.env, o.appName, err)
 		}
 
+		ecsClient := ecs.New(o.sess)
 		return &task.EnvRunner{
 			Count:     o.count,
 			GroupName: o.groupName,
@@ -256,12 +257,15 @@ func (o *runTaskOpts) configureRunner() (taskRunner, error) {
 			App: o.appName,
 			Env: o.env,
 
+			SecurityGroups: o.securityGroups,
+
 			OS: o.os,
 
-			VPCGetter:            vpcGetter,
-			ClusterGetter:        ecs.New(o.sess),
-			Starter:              ecsService,
-			EnvironmentDescriber: d,
+			VPCGetter:             vpcGetter,
+			ClusterGetter:         ecsClient,
+			Starter:               ecsService,
+			EnvironmentDescriber:  d,
+			NonZeroExitCodeGetter: ecsClient,
 		}, nil
 	}
 	return &task.ConfigRunner{
@@ -273,9 +277,10 @@ func (o *runTaskOpts) configureRunner() (taskRunner, error) {
 		SecurityGroups: o.securityGroups,
 		OS:             o.os,
 
-		VPCGetter:     vpcGetter,
-		ClusterGetter: ecsService,
-		Starter:       ecsService,
+		VPCGetter:             vpcGetter,
+		ClusterGetter:         ecsService,
+		Starter:               ecsService,
+		NonZeroExitCodeGetter: ecs.New(o.sess),
 	}, nil
 
 }
@@ -370,10 +375,6 @@ func (o *runTaskOpts) Validate() error {
 	}
 
 	if err := o.validateFlagsWithSubnets(); err != nil {
-		return err
-	}
-
-	if err := o.validateFlagsWithSecurityGroups(); err != nil {
 		return err
 	}
 
@@ -549,21 +550,6 @@ func (o *runTaskOpts) validateFlagsWithSubnets() error {
 	return nil
 }
 
-func (o *runTaskOpts) validateFlagsWithSecurityGroups() error {
-	if o.securityGroups == nil {
-		return nil
-	}
-
-	if o.appName != "" {
-		return fmt.Errorf("cannot specify both `--security-groups` and `--app`")
-	}
-
-	if o.env != "" {
-		return fmt.Errorf("cannot specify both `--security-groups` and `--env`")
-	}
-	return nil
-}
-
 func (o *runTaskOpts) validateFlagsWithWindows() error {
 	if !isWindowsOS(o.os) {
 		return nil
@@ -698,6 +684,9 @@ Did you tag your secrets with the "copilot-application" and "copilot-environment
 		if err := o.displayLogStream(); err != nil {
 			return err
 		}
+		if err := o.runner.CheckNonZeroExitCode(tasks); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -707,7 +696,11 @@ func (o *runTaskOpts) generateCommand() error {
 	if err != nil {
 		return err
 	}
-	log.Infoln(command.CLIString())
+	cliString, err := command.CLIString()
+	if err != nil {
+		return err
+	}
+	log.Infoln(cliString)
 	return nil
 }
 
@@ -1028,7 +1021,7 @@ func BuildTaskRunCmd() *cobra.Command {
 		Use:   "run",
 		Short: "Run a one-off task on Amazon ECS.",
 		Example: `
-  Run a task using your local Dockerfile and display log streams after the task is running. 
+  Run a task using your local Dockerfile and display log streams after the task is running.
   You will be prompted to specify an environment for the tasks to run in.
   /code $ copilot task run
   Run a task named "db-migrate" in the "test" environment under the current workspace.
@@ -1114,7 +1107,6 @@ func BuildTaskRunCmd() *cobra.Command {
 	taskFlags.AddFlag(cmd.Flags().Lookup(archFlag))
 	taskFlags.AddFlag(cmd.Flags().Lookup(envVarsFlag))
 	taskFlags.AddFlag(cmd.Flags().Lookup(secretsFlag))
-	taskFlags.AddFlag(cmd.Flags().Lookup(acknowledgeSecretsAccessFlag))
 	taskFlags.AddFlag(cmd.Flags().Lookup(commandFlag))
 	taskFlags.AddFlag(cmd.Flags().Lookup(entrypointFlag))
 	taskFlags.AddFlag(cmd.Flags().Lookup(resourceTagsFlag))
@@ -1122,6 +1114,7 @@ func BuildTaskRunCmd() *cobra.Command {
 	utilityFlags := pflag.NewFlagSet("Utility", pflag.ContinueOnError)
 	utilityFlags.AddFlag(cmd.Flags().Lookup(followFlag))
 	utilityFlags.AddFlag(cmd.Flags().Lookup(generateCommandFlag))
+	utilityFlags.AddFlag(cmd.Flags().Lookup(acknowledgeSecretsAccessFlag))
 
 	// prettify help menu.
 	cmd.Annotations = map[string]string{

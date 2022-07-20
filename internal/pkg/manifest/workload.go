@@ -1,7 +1,6 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package manifest provides functionality to create Manifest files.
 package manifest
 
 import (
@@ -11,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/aws/copilot-cli/internal/pkg/docker/dockerengine"
+	"github.com/aws/copilot-cli/internal/pkg/template"
 
 	"github.com/google/shlex"
 
@@ -22,12 +22,14 @@ const (
 	defaultDockerfileName = "Dockerfile"
 )
 
-// AWS VPC subnet placement options.
-var (
-	PublicSubnetPlacement  = Placement("public")
-	PrivateSubnetPlacement = Placement("private")
+const (
+	// AWS VPC subnet placement options.
+	PublicSubnetPlacement  = PlacementString("public")
+	PrivateSubnetPlacement = PlacementString("private")
+)
 
-	// All placement options.
+// All placement options.
+var (
 	subnetPlacements = []string{string(PublicSubnetPlacement), string(PrivateSubnetPlacement)}
 )
 
@@ -35,14 +37,16 @@ var (
 var (
 	ErrAppRunnerInvalidPlatformWindows = errors.New("Windows is not supported for App Runner services")
 
-	errUnmarshalBuildOpts    = errors.New("unable to unmarshal build field into string or compose-style map")
-	errUnmarshalPlatformOpts = errors.New("unable to unmarshal platform field into string or compose-style map")
-	errUnmarshalCountOpts    = errors.New(`unable to unmarshal "count" field to an integer or autoscaling configuration`)
-	errUnmarshalRangeOpts    = errors.New(`unable to unmarshal "range" field`)
+	errUnmarshalBuildOpts         = errors.New("unable to unmarshal build field into string or compose-style map")
+	errUnmarshalPlatformOpts      = errors.New("unable to unmarshal platform field into string or compose-style map")
+	errUnmarshalSecurityGroupOpts = errors.New(`unable to unmarshal "security_groups" field into slice of strings or compose-style map`)
+	errUnmarshalPlacementOpts     = errors.New("unable to unmarshal placement field into string or compose-style map")
+	errUnmarshalCountOpts         = errors.New(`unable to unmarshal "count" field to an integer or autoscaling configuration`)
+	errUnmarshalRangeOpts         = errors.New(`unable to unmarshal "range" field`)
 
 	errUnmarshalExec       = errors.New(`unable to unmarshal "exec" field into boolean or exec configuration`)
 	errUnmarshalEntryPoint = errors.New(`unable to unmarshal "entrypoint" into string or slice of strings`)
-	errUnmarshalAlias      = errors.New(`unable to unmarshal "alias" into string or slice of strings`)
+	errUnmarshalAlias      = errors.New(`unable to unmarshal "alias" into advanced alias map, string, or slice of strings`)
 	errUnmarshalCommand    = errors.New(`unable to unmarshal "command" into string or slice of strings`)
 )
 
@@ -55,6 +59,7 @@ func WorkloadTypes() []string {
 type WorkloadManifest interface {
 	ApplyEnv(envName string) (WorkloadManifest, error)
 	Validate() error
+	RequiredEnvironmentFeatures() []string
 }
 
 // UnmarshalWorkload deserializes the YAML input stream into a workload manifest object.
@@ -73,7 +78,6 @@ func UnmarshalWorkload(in []byte) (WorkloadManifest, error) {
 	switch typeVal {
 	case LoadBalancedWebServiceType:
 		m = newDefaultLoadBalancedWebService()
-
 	case RequestDrivenWebServiceType:
 		m = newDefaultRequestDrivenWebService()
 	case BackendServiceType:
@@ -268,6 +272,10 @@ type stringSliceOrString struct {
 	StringSlice []string
 }
 
+func (s *stringSliceOrString) isEmpty() bool {
+	return s.String == nil && len(s.StringSlice) == 0
+}
+
 func unmarshalYAMLToStringSliceOrString(s *stringSliceOrString, value *yaml.Node) error {
 	if err := value.Decode(&s.StringSlice); err != nil {
 		switch err.(type) {
@@ -381,38 +389,132 @@ func (c *NetworkConfig) IsEmpty() bool {
 	return c.VPC.isEmpty()
 }
 
-// UnmarshalYAML ensures that a NetworkConfig always defaults to public subnets.
-// If the user specified a placement that's not valid then throw an error.
-func (c *NetworkConfig) UnmarshalYAML(value *yaml.Node) error {
-	type networkWithDefaults NetworkConfig
-	publicPlacement := Placement(PublicSubnetPlacement)
-	defaultVPCConf := vpcConfig{
-		Placement: &publicPlacement,
+func (c *NetworkConfig) requiredEnvFeatures() []string {
+	if aws.StringValue((*string)(c.VPC.Placement.PlacementString)) == string(PrivateSubnetPlacement) {
+		return []string{template.NATFeatureName}
 	}
-	conf := networkWithDefaults{
-		VPC: defaultVPCConf,
-	}
-	if err := value.Decode(&conf); err != nil {
-		return err
-	}
-	if conf.VPC.isEmpty() { // If after unmarshaling the user did not specify VPC configuration then reset it to public.
-		conf.VPC = defaultVPCConf
-	}
-	*c = NetworkConfig(conf)
 	return nil
 }
 
-// Placement represents where to place tasks (public or private subnets).
-type Placement string
+// PlacementArgOrString represents where to place tasks.
+type PlacementArgOrString struct {
+	*PlacementString
+	PlacementArgs
+}
+
+// IsEmpty returns empty if the struct has all zero members.
+func (p *PlacementArgOrString) IsEmpty() bool {
+	return p.PlacementString == nil && p.PlacementArgs.isEmpty()
+}
+
+// UnmarshalYAML overrides the default YAML unmarshaling logic for the PlacementArgOrString
+// struct, allowing it to perform more complex unmarshaling behavior.
+// This method implements the yaml.Unmarshaler (v3) interface.
+func (p *PlacementArgOrString) UnmarshalYAML(value *yaml.Node) error {
+	if err := value.Decode(&p.PlacementArgs); err != nil {
+		switch err.(type) {
+		case *yaml.TypeError:
+			break
+		default:
+			return err
+		}
+	}
+	if !p.PlacementArgs.isEmpty() {
+		// Unmarshaled successfully to p.PlacementArgs, unset p.PlacementString, and return.
+		p.PlacementString = nil
+		return nil
+	}
+	if err := value.Decode(&p.PlacementString); err != nil {
+		return errUnmarshalPlacementOpts
+	}
+	return nil
+}
+
+// PlacementArgs represents what subnets to place tasks.
+type PlacementArgs struct {
+	Subnets []string `yaml:"subnets"`
+}
+
+func (p *PlacementArgs) isEmpty() bool {
+	return p.Subnets == nil || len(p.Subnets) == 0
+}
+
+// PlacementString represents what types of subnets (public or private subnets) to place tasks.
+type PlacementString string
+
+// SecurityGroupsIDsOrConfig represents security groups attached to task. It supports unmarshalling
+// yaml which can either be of type SecurityGroupsConfig or a list of strings.
+type SecurityGroupsIDsOrConfig struct {
+	IDs            []string
+	AdvancedConfig SecurityGroupsConfig
+}
+
+func (s *SecurityGroupsIDsOrConfig) isEmpty() bool {
+	return len(s.IDs) == 0 && s.AdvancedConfig.isEmpty()
+}
+
+// SecurityGroupsConfig represents which security groups are attached to a task
+// and if default security group is applied.
+type SecurityGroupsConfig struct {
+	SecurityGroups []string `yaml:"groups"`
+	DenyDefault    *bool    `yaml:"deny_default"`
+}
+
+func (s *SecurityGroupsConfig) isEmpty() bool {
+	return len(s.SecurityGroups) == 0 && s.DenyDefault == nil
+}
+
+// UnmarshalYAML overrides the default YAML unmarshalling logic for the SecurityGroupsIDsOrConfig
+// struct, allowing it to perform more complex unmarshalling behavior.
+// This method implements the yaml.Unmarshaler (v3) interface.
+func (s *SecurityGroupsIDsOrConfig) UnmarshalYAML(value *yaml.Node) error {
+	if err := value.Decode(&s.AdvancedConfig); err != nil {
+		switch err.(type) {
+		case *yaml.TypeError:
+			break
+		default:
+			return err
+		}
+	}
+
+	if !s.AdvancedConfig.isEmpty() {
+		// Unmarshalled successfully to s.AdvancedConfig, unset s.IDs, and return.
+		s.IDs = nil
+		return nil
+	}
+
+	if err := value.Decode(&s.IDs); err != nil {
+		return errUnmarshalSecurityGroupOpts
+	}
+	return nil
+}
+
+// GetIDs returns security groups from SecurityGroupsIDsOrConfig that are attached to task.
+// nil is returned if no security groups are specified.
+func (s *SecurityGroupsIDsOrConfig) GetIDs() []string {
+	if !s.AdvancedConfig.isEmpty() {
+		return s.AdvancedConfig.SecurityGroups
+	}
+	return s.IDs
+}
+
+// IsDefaultSecurityGroupDenied returns true if DenyDefault is set to true
+// in SecurityGroupsIDsOrConfig.AdvancedConfig. Otherwise, false is returned.
+func (s *SecurityGroupsIDsOrConfig) IsDefaultSecurityGroupDenied() bool {
+	if !s.AdvancedConfig.isEmpty() {
+		return aws.BoolValue(s.AdvancedConfig.DenyDefault)
+	}
+	return false
+}
 
 // vpcConfig represents the security groups and subnets attached to a task.
 type vpcConfig struct {
-	*Placement     `yaml:"placement"`
-	SecurityGroups []string `yaml:"security_groups"`
+	Placement      PlacementArgOrString      `yaml:"placement"`
+	SecurityGroups SecurityGroupsIDsOrConfig `yaml:"security_groups"`
 }
 
-func (c *vpcConfig) isEmpty() bool {
-	return c.Placement == nil && c.SecurityGroups == nil
+func (v *vpcConfig) isEmpty() bool {
+	return v.Placement.IsEmpty() && v.SecurityGroups.isEmpty()
 }
 
 // PlatformArgsOrString is a custom type which supports unmarshaling yaml which
@@ -564,4 +666,12 @@ func uint16P(n uint16) *uint16 {
 		return nil
 	}
 	return &n
+}
+
+func placementStringP(p PlacementString) *PlacementString {
+	if p == "" {
+		return nil
+	}
+	placement := p
+	return &placement
 }

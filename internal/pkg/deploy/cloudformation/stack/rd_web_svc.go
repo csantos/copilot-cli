@@ -5,6 +5,7 @@ package stack
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 
@@ -46,63 +47,58 @@ type requestDrivenWebSvcReadParser interface {
 // RequestDrivenWebService represents the configuration needed to create a CloudFormation stack from a request-drive web service manifest.
 type RequestDrivenWebService struct {
 	*appRunnerWkld
-	manifest            *manifest.RequestDrivenWebService
-	app                 deploy.AppInformation
-	customResourceS3URL map[string]string
+	manifest *manifest.RequestDrivenWebService
+	app      deploy.AppInformation
 
 	parser requestDrivenWebSvcReadParser
 }
 
-// NewRequestDrivenWebServiceWithAlias creates a new RequestDrivenWebService stack from a manifest file. It creates
-// custom resources needed for alias with scripts accessible from the urls.
-func NewRequestDrivenWebServiceWithAlias(mft *manifest.RequestDrivenWebService, env string, app deploy.AppInformation, rc RuntimeConfig, urls map[string]string) (*RequestDrivenWebService, error) {
-	rdSvc, err := NewRequestDrivenWebService(mft, env, app, rc)
-	if err != nil {
-		return nil, err
-	}
-	rdSvc.customResourceS3URL = urls
-	return rdSvc, nil
+// RequestDrivenWebServiceConfig contains data required to initialize a request-driven web service stack.
+type RequestDrivenWebServiceConfig struct {
+	App         deploy.AppInformation
+	Env         string
+	Manifest    *manifest.RequestDrivenWebService
+	RawManifest []byte
+
+	RuntimeConfig RuntimeConfig
 }
 
 // NewRequestDrivenWebService creates a new RequestDrivenWebService stack from a manifest file.
-func NewRequestDrivenWebService(mft *manifest.RequestDrivenWebService, env string, app deploy.AppInformation, rc RuntimeConfig) (*RequestDrivenWebService, error) {
+func NewRequestDrivenWebService(cfg RequestDrivenWebServiceConfig) (*RequestDrivenWebService, error) {
 	parser := template.New()
-	addons, err := addon.New(aws.StringValue(mft.Name))
+	addons, err := addon.New(aws.StringValue(cfg.Manifest.Name))
 	if err != nil {
 		return nil, fmt.Errorf("new addons: %w", err)
 	}
 	return &RequestDrivenWebService{
 		appRunnerWkld: &appRunnerWkld{
 			wkld: &wkld{
-				name:   aws.StringValue(mft.Name),
-				env:    env,
-				app:    app.Name,
-				rc:     rc,
-				image:  mft.ImageConfig.Image,
-				addons: addons,
-				parser: parser,
+				name:        aws.StringValue(cfg.Manifest.Name),
+				env:         cfg.Env,
+				app:         cfg.App.Name,
+				rc:          cfg.RuntimeConfig,
+				image:       cfg.Manifest.ImageConfig.Image,
+				rawManifest: cfg.RawManifest,
+				addons:      addons,
+				parser:      parser,
 			},
-			instanceConfig:    mft.InstanceConfig,
-			imageConfig:       mft.ImageConfig,
-			healthCheckConfig: mft.HealthCheckConfiguration,
+			instanceConfig:    cfg.Manifest.InstanceConfig,
+			imageConfig:       cfg.Manifest.ImageConfig,
+			healthCheckConfig: cfg.Manifest.HealthCheckConfiguration,
 		},
-		app:      app,
-		manifest: mft,
+		app:      cfg.App,
+		manifest: cfg.Manifest,
 		parser:   parser,
 	}, nil
 }
 
 // Template returns the CloudFormation template for the service parametrized for the environment.
 func (s *RequestDrivenWebService) Template() (string, error) {
-	networkConfig := convertRDWSNetworkConfig(s.manifest.Network)
-	var envControllerLambda string
-	if networkConfig.SubnetsType == template.PrivateSubnetsPlacement {
-		content, err := s.parser.Read(envControllerPath)
-		if err != nil {
-			return "", fmt.Errorf("read env controller lambda: %w", err)
-		}
-		envControllerLambda = content.String()
+	crs, err := convertCustomResources(s.rc.CustomResourcesURL)
+	if err != nil {
+		return "", err
 	}
+	networkConfig := convertRDWSNetworkConfig(s.manifest.Network)
 	addonsParams, err := s.addonsParameters()
 	if err != nil {
 		return "", err
@@ -111,13 +107,8 @@ func (s *RequestDrivenWebService) Template() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var layerARN, bucket, dnsDelegationRole, dnsName *string
-	var urls map[string]*string
+	var layerARN, dnsDelegationRole, dnsName *string
 	if s.manifest.Alias != nil {
-		bucket, urls, err = parseS3URLs(s.customResourceS3URL)
-		if err != nil {
-			return "", err
-		}
 		dnsDelegationRole, dnsName = convertAppInformation(s.app)
 		layerARN = awsSDKLayerForRegion[s.rc.Region]
 	}
@@ -126,17 +117,20 @@ func (s *RequestDrivenWebService) Template() (string, error) {
 		return "", fmt.Errorf(`convert "publish" field for service %s: %w`, s.name, err)
 	}
 	content, err := s.parser.ParseRequestDrivenWebService(template.WorkloadOpts{
-		Variables:         s.manifest.Variables,
-		StartCommand:      s.manifest.StartCommand,
-		Tags:              s.manifest.Tags,
-		NestedStack:       addonsOutputs,
-		AddonsExtraParams: addonsParams,
-		EnableHealthCheck: !s.healthCheckConfig.IsEmpty(),
+		AppName:            s.wkld.app,
+		EnvName:            s.env,
+		WorkloadName:       s.name,
+		SerializedManifest: string(s.rawManifest),
 
+		Variables:            s.manifest.Variables,
+		StartCommand:         s.manifest.StartCommand,
+		Tags:                 s.manifest.Tags,
+		NestedStack:          addonsOutputs,
+		AddonsExtraParams:    addonsParams,
+		EnableHealthCheck:    !s.healthCheckConfig.IsEmpty(),
+		WorkloadType:         manifest.RequestDrivenWebServiceType,
 		Alias:                s.manifest.Alias,
-		ScriptBucketName:     bucket,
-		EnvControllerLambda:  envControllerLambda,
-		CustomDomainLambda:   urls[template.AppRunnerCustomDomainLambdaFileName],
+		CustomResources:      crs,
 		AWSSDKLayer:          layerARN,
 		AppDNSDelegationRole: dnsDelegationRole,
 		AppDNSName:           dnsName,
@@ -144,6 +138,10 @@ func (s *RequestDrivenWebService) Template() (string, error) {
 
 		Publish:                  publishers,
 		ServiceDiscoveryEndpoint: s.rc.ServiceDiscoveryEndpoint,
+
+		Observability: template.ObservabilityOpts{
+			Tracing: strings.ToUpper(aws.StringValue(s.manifest.Observability.Tracing)),
+		},
 	})
 	if err != nil {
 		return "", err
@@ -151,8 +149,7 @@ func (s *RequestDrivenWebService) Template() (string, error) {
 	return content.String(), nil
 }
 
-// SerializedParameters returns the CloudFormation stack's parameters serialized
-// to a YAML document annotated with comments for readability to users.
+// SerializedParameters returns the CloudFormation stack's parameters serialized to a JSON document.
 func (s *RequestDrivenWebService) SerializedParameters() (string, error) {
-	return s.templateConfiguration(s)
+	return serializeTemplateConfig(s.wkld.parser, s)
 }

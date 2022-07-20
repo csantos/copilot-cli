@@ -4,8 +4,10 @@
 package stack
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/crc32"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,7 +19,6 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/aws/s3"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
 
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/template"
@@ -43,8 +44,20 @@ const (
 	capacityProviderFargate     = "FARGATE"
 )
 
+// MinimumHealthyPercent and MaximumPercent configurations as per deployment strategy.
+const (
+	minHealthyPercentRecreate = 0
+	maxPercentRecreate        = 100
+	minHealthyPercentDefault  = 100
+	maxPercentDefault         = 200
+)
+
 var (
 	taskDefOverrideRulePrefixes = []string{"Resources", "TaskDefinition", "Properties"}
+	subnetPlacementForTemplate  = map[manifest.PlacementString]string{
+		manifest.PrivateSubnetPlacement: template.PrivateSubnetsPlacement,
+		manifest.PublicSubnetPlacement:  template.PublicSubnetsPlacement,
+	}
 )
 
 // convertSidecar converts the manifest sidecar configuration into a format parsable by the templates pkg.
@@ -52,8 +65,17 @@ func convertSidecar(s map[string]*manifest.SidecarConfig) ([]*template.SidecarOp
 	if s == nil {
 		return nil, nil
 	}
+
+	// Sort the sidecars so that the order is consistent and the integration test won't be flaky.
+	keys := make([]string, 0, len(s))
+	for k := range s {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	var sidecars []*template.SidecarOpts
-	for name, config := range s {
+	for _, name := range keys {
+		config := s[name]
 		port, protocol, err := manifest.ParsePortMapping(config.Port)
 		if err != nil {
 			return nil, err
@@ -104,6 +126,32 @@ func convertContainerHealthCheck(hc manifest.ContainerHealthCheck) *template.Con
 	}
 }
 
+func convertHostedZone(m manifest.RoutingRuleConfiguration) (template.AliasesForHostedZone, error) {
+	aliasesFor := make(map[string][]string)
+	defaultHostedZone := m.HostedZone
+	if len(m.Alias.AdvancedAliases) != 0 {
+		for _, alias := range m.Alias.AdvancedAliases {
+			if alias.HostedZone != nil {
+				aliasesFor[*alias.HostedZone] = append(aliasesFor[*alias.HostedZone], *alias.Alias)
+				continue
+			}
+			if defaultHostedZone != nil {
+				aliasesFor[*defaultHostedZone] = append(aliasesFor[*defaultHostedZone], *alias.Alias)
+			}
+		}
+		return aliasesFor, nil
+	}
+	if defaultHostedZone == nil {
+		return aliasesFor, nil
+	}
+	aliases, err := m.Alias.ToStringSlice()
+	if err != nil {
+		return nil, err
+	}
+	aliasesFor[*defaultHostedZone] = aliases
+	return aliasesFor, nil
+}
+
 // convertDependsOn converts image and sidecar depends on fields to have upper case statuses.
 func convertDependsOn(d manifest.DependsOn) map[string]string {
 	if d == nil {
@@ -134,11 +182,7 @@ func convertAdvancedCount(a manifest.AdvancedCount) (*template.AdvancedCount, er
 // convertCapacityProviders transforms the manifest fields into a format
 // parsable by the templates pkg.
 func convertCapacityProviders(a manifest.AdvancedCount) []*template.CapacityProviderStrategy {
-	if a.IsEmpty() {
-		return nil
-	}
-	// return if autoscaling range specified without spot scaling
-	if !a.Range.IsEmpty() && a.Range.Value != nil {
+	if a.Spot == nil && a.Range.RangeConfig.SpotFrom == nil {
 		return nil
 	}
 	var cps []*template.CapacityProviderStrategy
@@ -147,29 +191,64 @@ func convertCapacityProviders(a manifest.AdvancedCount) []*template.CapacityProv
 		Weight:           aws.Int(1),
 		CapacityProvider: capacityProviderFargateSpot,
 	})
+	rc := a.Range.RangeConfig
 	// Return if only spot is specifed as count
-	if a.Range.IsEmpty() {
+	if rc.SpotFrom == nil {
 		return cps
 	}
 	// Scaling with spot
-	rc := a.Range.RangeConfig
-	if !rc.IsEmpty() {
-		spotFrom := aws.IntValue(rc.SpotFrom)
-		min := aws.IntValue(rc.Min)
-		// If spotFrom value is not equal to the autoscaling min, then
-		// the base value on the Fargate Capacity provider must be set
-		// to one less than spotFrom
-		if spotFrom > min {
-			base := spotFrom - 1
-			fgCapacity := &template.CapacityProviderStrategy{
-				Base:             aws.Int(base),
-				Weight:           aws.Int(0),
-				CapacityProvider: capacityProviderFargate,
-			}
-			cps = append(cps, fgCapacity)
+	spotFrom := aws.IntValue(rc.SpotFrom)
+	min := aws.IntValue(rc.Min)
+	// If spotFrom value is not equal to the autoscaling min, then
+	// the base value on the Fargate Capacity provider must be set
+	// to one less than spotFrom
+	if spotFrom > min {
+		base := spotFrom - 1
+		fgCapacity := &template.CapacityProviderStrategy{
+			Base:             aws.Int(base),
+			Weight:           aws.Int(0),
+			CapacityProvider: capacityProviderFargate,
 		}
+		cps = append(cps, fgCapacity)
 	}
 	return cps
+}
+
+// convertCooldown converts a service manifest cooldown struct into a format parsable
+// by the templates pkg.
+func convertCooldown(c manifest.Cooldown) template.Cooldown {
+	if c.IsEmpty() {
+		return template.Cooldown{}
+	}
+
+	cooldown := template.Cooldown{}
+
+	if c.ScaleInCooldown != nil {
+		scaleInTime := float64(*c.ScaleInCooldown) / float64(time.Second)
+		cooldown.ScaleInCooldown = aws.Float64(scaleInTime)
+	}
+	if c.ScaleOutCooldown != nil {
+		scaleOutTime := float64(*c.ScaleOutCooldown) / float64(time.Second)
+		cooldown.ScaleOutCooldown = aws.Float64(scaleOutTime)
+	}
+
+	return cooldown
+}
+
+// convertScalingCooldown handles the logic of converting generalized and specific cooldowns set
+// into the scaling cooldown used in the Auto Scaling configuration.
+func convertScalingCooldown(specCooldown, genCooldown manifest.Cooldown) template.Cooldown {
+	cooldown := convertCooldown(genCooldown)
+
+	specTemplateCooldown := convertCooldown(specCooldown)
+	if specCooldown.ScaleInCooldown != nil {
+		cooldown.ScaleInCooldown = specTemplateCooldown.ScaleInCooldown
+	}
+	if specCooldown.ScaleOutCooldown != nil {
+		cooldown.ScaleOutCooldown = specTemplateCooldown.ScaleOutCooldown
+	}
+
+	return cooldown
 }
 
 // convertAutoscaling converts the service's Auto Scaling configuration into a format parsable
@@ -190,19 +269,40 @@ func convertAutoscaling(a manifest.AdvancedCount) (*template.AutoscalingOpts, er
 		MinCapacity: &min,
 		MaxCapacity: &max,
 	}
-	if a.CPU != nil {
-		autoscalingOpts.CPU = aws.Float64(float64(*a.CPU))
+
+	if a.CPU.Value != nil {
+		autoscalingOpts.CPU = aws.Float64(float64(*a.CPU.Value))
 	}
-	if a.Memory != nil {
-		autoscalingOpts.Memory = aws.Float64(float64(*a.Memory))
+	if a.CPU.ScalingConfig.Value != nil {
+		autoscalingOpts.CPU = aws.Float64(float64(*a.CPU.ScalingConfig.Value))
 	}
-	if a.Requests != nil {
-		autoscalingOpts.Requests = aws.Float64(float64(*a.Requests))
+	if a.Memory.Value != nil {
+		autoscalingOpts.Memory = aws.Float64(float64(*a.Memory.Value))
 	}
-	if a.ResponseTime != nil {
-		responseTime := float64(*a.ResponseTime) / float64(time.Second)
+	if a.Memory.ScalingConfig.Value != nil {
+		autoscalingOpts.Memory = aws.Float64(float64(*a.Memory.ScalingConfig.Value))
+	}
+	if a.Requests.Value != nil {
+		autoscalingOpts.Requests = aws.Float64(float64(*a.Requests.Value))
+	}
+	if a.Requests.ScalingConfig.Value != nil {
+		autoscalingOpts.Requests = aws.Float64(float64(*a.Requests.ScalingConfig.Value))
+	}
+	if a.ResponseTime.Value != nil {
+		responseTime := float64(*a.ResponseTime.Value) / float64(time.Second)
 		autoscalingOpts.ResponseTime = aws.Float64(responseTime)
 	}
+	if a.ResponseTime.ScalingConfig.Value != nil {
+		responseTime := float64(*a.ResponseTime.ScalingConfig.Value) / float64(time.Second)
+		autoscalingOpts.ResponseTime = aws.Float64(responseTime)
+	}
+
+	autoscalingOpts.CPUCooldown = convertScalingCooldown(a.CPU.ScalingConfig.Cooldown, a.Cooldown)
+	autoscalingOpts.MemCooldown = convertScalingCooldown(a.Memory.ScalingConfig.Cooldown, a.Cooldown)
+	autoscalingOpts.ReqCooldown = convertScalingCooldown(a.Requests.ScalingConfig.Cooldown, a.Cooldown)
+	autoscalingOpts.RespTimeCooldown = convertScalingCooldown(a.ResponseTime.ScalingConfig.Cooldown, a.Cooldown)
+	autoscalingOpts.QueueDelayCooldown = convertScalingCooldown(a.QueueScaling.Cooldown, a.Cooldown)
+
 	if !a.QueueScaling.IsEmpty() {
 		acceptableBacklog, err := a.QueueScaling.AcceptableBacklogPerTask()
 		if err != nil {
@@ -228,6 +328,9 @@ func convertHTTPHealthCheck(hc *manifest.HealthCheckArgsOrString) template.HTTPH
 	} else if hc.HealthCheckPath != nil {
 		opts.HealthCheckPath = *hc.HealthCheckPath
 	}
+	if hc.HealthCheckArgs.Port != nil {
+		opts.Port = strconv.Itoa(aws.IntValue(hc.HealthCheckArgs.Port))
+	}
 	if hc.HealthCheckArgs.SuccessCodes != nil {
 		opts.SuccessCodes = *hc.HealthCheckArgs.SuccessCodes
 	}
@@ -249,8 +352,6 @@ type networkLoadBalancerConfig struct {
 	// If a domain is associated these values are not empty.
 	appDNSDelegationRole *string
 	appDNSName           *string
-	certValidatorLambda  string
-	customDomainLambda   string
 }
 
 func (s *LoadBalancedWebService) convertNetworkLoadBalancer() (networkLoadBalancerConfig, error) {
@@ -329,17 +430,6 @@ func (s *LoadBalancedWebService) convertNetworkLoadBalancer() (networkLoadBalanc
 		dnsDelegationRole, dnsName := convertAppInformation(s.appInfo)
 		config.appDNSName = dnsName
 		config.appDNSDelegationRole = dnsDelegationRole
-
-		nlbCertValidatorLambda, err := s.parser.Read(nlbCertValidatorPath)
-		if err != nil {
-			return networkLoadBalancerConfig{}, fmt.Errorf("read nlb certificate validator lambda: %w", err)
-		}
-		nlbCustomDomainLambda, err := s.parser.Read(nlbCustomDomainPath)
-		if err != nil {
-			return networkLoadBalancerConfig{}, fmt.Errorf("read nlb custom domain lambda: %w", err)
-		}
-		config.certValidatorLambda = nlbCertValidatorLambda.String()
-		config.customDomainLambda = nlbCustomDomainLambda.String()
 	}
 	return config, nil
 }
@@ -573,15 +663,23 @@ func convertNetworkConfig(network manifest.NetworkConfig) template.NetworkOpts {
 	opts := template.NetworkOpts{
 		AssignPublicIP: template.EnablePublicIP,
 		SubnetsType:    template.PublicSubnetsPlacement,
-		SecurityGroups: network.VPC.SecurityGroups,
 	}
-	if network.VPC.Placement == nil {
+	opts.SecurityGroups = network.VPC.SecurityGroups.GetIDs()
+	opts.DenyDefaultSecurityGroup = network.VPC.SecurityGroups.IsDefaultSecurityGroupDenied()
+
+	placement := network.VPC.Placement
+	if placement.IsEmpty() {
 		return opts
 	}
-	if *network.VPC.Placement != manifest.PublicSubnetPlacement {
+	if placement.PlacementString == nil {
 		opts.AssignPublicIP = template.DisablePublicIP
-		opts.SubnetsType = template.PrivateSubnetsPlacement
+		opts.SubnetIDs = placement.PlacementArgs.Subnets
+		return opts
 	}
+	if *placement.PlacementString == manifest.PrivateSubnetPlacement {
+		opts.AssignPublicIP = template.DisablePublicIP
+	}
+	opts.SubnetsType = subnetPlacementForTemplate[*placement.PlacementString]
 	return opts
 }
 
@@ -590,12 +688,15 @@ func convertRDWSNetworkConfig(network manifest.RequestDrivenWebServiceNetworkCon
 	if network.IsEmpty() {
 		return opts
 	}
-	if network.VPC.Placement == nil {
+	placement := network.VPC.Placement
+	if placement.IsEmpty() {
 		return opts
 	}
-	if string(*network.VPC.Placement) == string(manifest.PrivateSubnetPlacement) {
-		opts.SubnetsType = template.PrivateSubnetsPlacement
+	if placement.PlacementString == nil {
+		opts.SubnetIDs = placement.PlacementArgs.Subnets
+		return opts
 	}
+	opts.SubnetsType = subnetPlacementForTemplate[*placement.PlacementString]
 	return opts
 }
 
@@ -613,6 +714,18 @@ func convertEntryPoint(entrypoint manifest.EntryPointOverride) ([]string, error)
 		return nil, fmt.Errorf(`convert "entrypoint" to string slice: %w`, err)
 	}
 	return out, nil
+}
+
+func convertDeploymentConfig(deploymentConfig manifest.DeploymentConfiguration) template.DeploymentConfigurationOpts {
+	var deployConfigs template.DeploymentConfigurationOpts
+	if strings.EqualFold(aws.StringValue(deploymentConfig.Rolling), manifest.ECSRecreateRollingUpdateStrategy) {
+		deployConfigs.MinHealthyPercent = minHealthyPercentRecreate
+		deployConfigs.MaxPercent = maxPercentRecreate
+	} else {
+		deployConfigs.MinHealthyPercent = minHealthyPercentDefault
+		deployConfigs.MaxPercent = maxPercentDefault
+	}
+	return deployConfigs
 }
 
 func convertCommand(command manifest.CommandOverride) ([]string, error) {
@@ -648,36 +761,53 @@ func convertPublish(topics []manifest.Topic, accountID, region, app, env, svc st
 	return &publishers, nil
 }
 
-func convertSubscribe(s manifest.SubscribeConfig, accountID, region, app, env, svc string) (*template.SubscribeOpts, error) {
+func convertSubscribe(s manifest.SubscribeConfig) (*template.SubscribeOpts, error) {
 	if s.Topics == nil {
 		return nil, nil
 	}
-	sqsEndpoint, err := endpoints.DefaultResolver().EndpointFor(endpoints.SqsServiceID, region)
-	if err != nil {
-		return nil, err
-	}
 	var subscriptions template.SubscribeOpts
 	for _, sb := range s.Topics {
-		ts := convertTopicSubscription(sb, sqsEndpoint.URL, accountID, app, env, svc)
+		ts, err := convertTopicSubscription(sb)
+		if err != nil {
+			return nil, err
+		}
 		subscriptions.Topics = append(subscriptions.Topics, ts)
 	}
 	subscriptions.Queue = convertQueue(s.Queue)
 	return &subscriptions, nil
 }
 
-func convertTopicSubscription(t manifest.TopicSubscription, url, accountID, app, env, svc string) *template.TopicSubscription {
+func convertTopicSubscription(t manifest.TopicSubscription) (
+	*template.TopicSubscription, error) {
+	filterPolicy, err := convertFilterPolicy(t.FilterPolicy)
+	if err != nil {
+		return nil, err
+	}
 	if aws.BoolValue(t.Queue.Enabled) {
 		return &template.TopicSubscription{
-			Name:    t.Name,
-			Service: t.Service,
-			Queue:   &template.SQSQueue{},
-		}
+			Name:         t.Name,
+			Service:      t.Service,
+			Queue:        &template.SQSQueue{},
+			FilterPolicy: filterPolicy,
+		}, nil
 	}
 	return &template.TopicSubscription{
-		Name:    t.Name,
-		Service: t.Service,
-		Queue:   convertQueue(t.Queue.Advanced),
+		Name:         t.Name,
+		Service:      t.Service,
+		Queue:        convertQueue(t.Queue.Advanced),
+		FilterPolicy: filterPolicy,
+	}, nil
+}
+
+func convertFilterPolicy(filterPolicy map[string]interface{}) (*string, error) {
+	if len(filterPolicy) == 0 {
+		return nil, nil
 	}
+	bytes, err := json.Marshal(filterPolicy)
+	if err != nil {
+		return nil, fmt.Errorf(`convert "filter_policy" to a JSON string: %w`, err)
+	}
+	return aws.String(string(bytes)), nil
 }
 
 func convertQueue(q manifest.SQSQueue) *template.SQSQueue {
@@ -720,30 +850,13 @@ func convertDeadLetter(d manifest.DeadLetterQueue) *template.DeadLetterQueue {
 	}
 }
 
-func parseS3URLs(nameToS3URL map[string]string) (bucket *string, s3ObjectKeys map[string]*string, err error) {
-	if len(nameToS3URL) == 0 {
-		return nil, nil, nil
-	}
-	s3ObjectKeys = make(map[string]*string)
-	for fname, s3url := range nameToS3URL {
-		bucketName, key, err := s3.ParseURL(s3url)
-		if err != nil {
-			return nil, nil, err
-		}
-		s3ObjectKeys[fname] = &key
-		bucket = &bucketName
-	}
-	return
-}
-
-func convertAppInformation(app deploy.AppInformation) (delegationRole *string, dnsName *string) {
+func convertAppInformation(app deploy.AppInformation) (delegationRole *string, domain *string) {
 	role := app.DNSDelegationRole()
 	if role != "" {
 		delegationRole = &role
 	}
-	dns := app.DNSName
-	if dns != "" {
-		dnsName = &dns
+	if app.Domain != "" {
+		domain = &app.Domain
 	}
 	return
 }
@@ -792,4 +905,19 @@ func convertSecrets(secrets map[string]manifest.Secret) map[string]template.Secr
 		m[name] = tplSecret
 	}
 	return m
+}
+
+func convertCustomResources(urlForFunc map[string]string) (map[string]template.S3ObjectLocation, error) {
+	out := make(map[string]template.S3ObjectLocation)
+	for fn, url := range urlForFunc {
+		bucket, key, err := s3.ParseURL(url)
+		if err != nil {
+			return nil, fmt.Errorf("convert custom resource %q url: %w", fn, err)
+		}
+		out[fn] = template.S3ObjectLocation{
+			Bucket: bucket,
+			Key:    key,
+		}
+	}
+	return out, nil
 }

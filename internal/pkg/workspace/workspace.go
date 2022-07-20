@@ -7,10 +7,17 @@
 //  .
 //  ├── copilot                        (application directory)
 //  │   ├── .workspace                 (workspace summary)
-//  │   └── my-service
+//  │   ├── my-service
 //  │   │   └── manifest.yml           (service manifest)
-//  │   ├── buildspec.yml              (buildspec for the pipeline's build stage)
-//  │   └── pipeline.yml               (pipeline manifest)
+//  |   |   environments
+//  |   |   └── test
+//  │   │       └── manifest.yml       (environment manifest for the environment test)
+//  │   ├── buildspec.yml              (legacy buildspec for the pipeline's build stage)
+//  │   ├── pipeline.yml               (legacy pipeline manifest)
+//  │   ├── pipelines
+//  │   │   ├── pipeline-app-beta
+//  │   │   │   ├── buildspec.yml      (buildspec for the pipeline 'pipeline-app-beta')
+//  │   ┴   ┴   └── manifest.yml       (pipeline manifest for the pipeline 'pipeline-app-beta')
 //  └── my-service-src                 (customer service code)
 package workspace
 
@@ -18,11 +25,12 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
-	"github.com/aws/copilot-cli/internal/pkg/term/log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/aws/copilot-cli/internal/pkg/term/log"
 
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/spf13/afero"
@@ -37,8 +45,9 @@ const (
 
 	addonsDirName             = "addons"
 	pipelinesDirName          = "pipelines"
+	environmentsDirName       = "environments"
 	maximumParentDirsToSearch = 5
-	pipelineFileName          = "pipeline.yml"
+	legacyPipelineFileName    = "pipeline.yml"
 	manifestFileName          = "manifest.yml"
 	buildspecFileName         = "buildspec.yml"
 
@@ -59,7 +68,7 @@ type Summary struct {
 type Workspace struct {
 	workingDir string
 	copilotDir string
-	fsUtils    *afero.Afero
+	fs         *afero.Afero
 	logger     func(format string, args ...interface{})
 }
 
@@ -75,7 +84,7 @@ func New() (*Workspace, error) {
 	}
 	ws := Workspace{
 		workingDir: workingDir,
-		fsUtils:    fsUtils,
+		fs:         fsUtils,
 		logger:     logger,
 	}
 
@@ -120,9 +129,9 @@ func (ws *Workspace) Summary() (*Summary, error) {
 	if err != nil {
 		return nil, err
 	}
-	summaryFileExists, _ := ws.fsUtils.Exists(summaryPath) // If an err occurs, return no applications.
+	summaryFileExists, _ := ws.fs.Exists(summaryPath) // If an err occurs, return no applications.
 	if summaryFileExists {
-		value, err := ws.fsUtils.ReadFile(summaryPath)
+		value, err := ws.fs.ReadFile(summaryPath)
 		if err != nil {
 			return nil, err
 		}
@@ -173,68 +182,64 @@ type PipelineManifest struct {
 
 // ListPipelines returns all pipelines in the workspace.
 func (ws *Workspace) ListPipelines() ([]PipelineManifest, error) {
-	var pipelineManifests []PipelineManifest
-	// Look for legacy pipeline.
-	legacyPath, err := ws.PipelineManifestLegacyPath()
-	if err != nil {
-		return nil, err
-	}
-	manifest, err := ws.ReadPipelineManifest(legacyPath)
-	if err != nil {
+	var manifests []PipelineManifest
+
+	addManifest := func(manifestPath string) {
+		manifest, err := ws.ReadPipelineManifest(manifestPath)
 		switch {
 		case errors.Is(err, ErrNoPipelineInWorkspace):
-			ws.logger("Unable to read pipeline manifest at '%s': %w", legacyPath, err)
-		default:
-			return nil, err
+			// no file at manifestPath, ignore it
+			return
+		case err != nil:
+			ws.logger("Unable to read pipeline manifest at '%s': %s\n", manifestPath, err)
+			return
 		}
-	} else {
-		pipelineManifests = append(pipelineManifests, PipelineManifest{
+
+		manifests = append(manifests, PipelineManifest{
 			Name: manifest.Name,
-			Path: legacyPath,
+			Path: manifestPath,
 		})
 	}
-	// Look for other pipelines.
-	pipelinesPath, err := ws.pipelinesDirPath()
+
+	// add the legacy pipeline
+	legacyPath, err := ws.pipelineManifestLegacyPath()
 	if err != nil {
 		return nil, err
 	}
-	exists, err := ws.fsUtils.Exists(pipelinesPath)
+	addManifest(legacyPath)
+
+	// add each file that matches pipelinesDir/*/manifest.yml
+	pipelinesDir, err := ws.pipelinesDirPath()
 	if err != nil {
-		return nil, fmt.Errorf("check if pipeline manifest exists at %s: %w", pipelinesPath, err)
+		return nil, err
 	}
-	if !exists {
-		return pipelineManifests, nil
+
+	exists, err := ws.fs.Exists(pipelinesDir)
+	switch {
+	case err != nil:
+		return nil, fmt.Errorf("check if pipelines directory exists at %q: %w", pipelinesDir, err)
+	case !exists:
+		// there is at most 1 manifest (the legacy one), so we don't need to sort
+		return manifests, nil
 	}
-	// Look through the existent pipelines dir for pipeline manifests.
-	files, err := ws.fsUtils.ReadDir(pipelinesPath)
+
+	files, err := ws.fs.ReadDir(pipelinesDir)
 	if err != nil {
-		return nil, fmt.Errorf("read directory %s: %w", pipelinesPath, err)
+		return nil, fmt.Errorf("read directory %q: %w", pipelinesDir, err)
 	}
-	for _, file := range files {
-		// Ignore buildspecs.
-		if strings.HasSuffix(file.Name(), "buildspec.yml") {
-			continue
-		}
-		// Read manifests of moved legacy pipeline and any other pipelines.
-		if strings.HasSuffix(file.Name(), ".yml") {
-			path := filepath.Join(pipelinesPath, file.Name())
-			manifest, err := ws.ReadPipelineManifest(path)
-			if err != nil {
-				switch {
-				case errors.Is(err, ErrNoPipelineInWorkspace):
-					ws.logger("Unable to read pipeline manifest at '%s': %w", legacyPath, err)
-				default:
-					return nil, err
-				}
-			} else {
-				pipelineManifests = append(pipelineManifests, PipelineManifest{
-					Name: manifest.Name,
-					Path: path,
-				})
-			}
+
+	for _, dir := range files {
+		if dir.IsDir() {
+			addManifest(filepath.Join(pipelinesDir, dir.Name(), manifestFileName))
 		}
 	}
-	return pipelineManifests, nil
+
+	// sort manifests alphabetically by Name
+	sort.Slice(manifests, func(i, j int) bool {
+		return manifests[i].Name < manifests[j].Name
+	})
+
+	return manifests, nil
 }
 
 // listWorkloads returns the name of all workloads (either services or jobs) in the workspace.
@@ -243,7 +248,7 @@ func (ws *Workspace) listWorkloads(match func(string) bool) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	files, err := ws.fsUtils.ReadDir(copilotPath)
+	files, err := ws.fs.ReadDir(copilotPath)
 	if err != nil {
 		return nil, fmt.Errorf("read directory %s: %w", copilotPath, err)
 	}
@@ -252,7 +257,7 @@ func (ws *Workspace) listWorkloads(match func(string) bool) ([]string, error) {
 		if !f.IsDir() {
 			continue
 		}
-		if exists, _ := ws.fsUtils.Exists(filepath.Join(copilotPath, f.Name(), manifestFileName)); !exists {
+		if exists, _ := ws.fs.Exists(filepath.Join(copilotPath, f.Name(), manifestFileName)); !exists {
 			// Swallow the error because we don't want to include any services that we don't have permissions to read.
 			continue
 		}
@@ -271,6 +276,31 @@ func (ws *Workspace) listWorkloads(match func(string) bool) ([]string, error) {
 	return names, nil
 }
 
+// ListEnvironments returns the name of the environments in the workspace.
+func (ws *Workspace) ListEnvironments() ([]string, error) {
+	copilotPath, err := ws.copilotDirPath()
+	if err != nil {
+		return nil, err
+	}
+	envPath := filepath.Join(copilotPath, environmentsDirName)
+	files, err := ws.fs.ReadDir(envPath)
+	if err != nil {
+		return nil, fmt.Errorf("read directory %s: %w", envPath, err)
+	}
+	var names []string
+	for _, f := range files {
+		if !f.IsDir() {
+			continue
+		}
+		if exists, _ := ws.fs.Exists(filepath.Join(copilotPath, environmentsDirName, f.Name(), manifestFileName)); !exists {
+			// Swallow the error because we don't want to include any environments that we don't have permissions to read.
+			continue
+		}
+		names = append(names, f.Name())
+	}
+	return names, nil
+}
+
 // ReadWorkloadManifest returns the contents of the workload's manifest under copilot/{name}/manifest.yml.
 func (ws *Workspace) ReadWorkloadManifest(mftDirName string) (WorkloadManifest, error) {
 	raw, err := ws.read(mftDirName, manifestFileName)
@@ -278,26 +308,42 @@ func (ws *Workspace) ReadWorkloadManifest(mftDirName string) (WorkloadManifest, 
 		return nil, err
 	}
 	mft := WorkloadManifest(raw)
-	mftName, err := mft.workloadName()
+	if err := ws.manifestNameMatchWithDir(mft, mftDirName); err != nil {
+		return nil, err
+	}
+	return mft, nil
+}
+
+// ReadEnvironmentManifest returns the contents of the environment's manifest under copilot/environments/{name}/manifest.yml.
+func (ws *Workspace) ReadEnvironmentManifest(mftDirName string) (EnvironmentManifest, error) {
+	raw, err := ws.read(environmentsDirName, mftDirName, manifestFileName)
 	if err != nil {
 		return nil, err
 	}
-	if mftName != mftDirName {
-		return nil, fmt.Errorf(`name of the manifest "%s" and directory "%s" do not match`, mftName, mftDirName)
+	mft := EnvironmentManifest(raw)
+	if err := ws.manifestNameMatchWithDir(mft, mftDirName); err != nil {
+		return nil, err
+	}
+	typ, err := retrieveTypeFromManifest(mft)
+	if err != nil {
+		return nil, err
+	}
+	if typ != manifest.EnvironmentManifestType {
+		return nil, fmt.Errorf(`manifest %s has type of "%s", not "%s"`, mftDirName, typ, manifest.EnvironmentManifestType)
 	}
 	return mft, nil
 }
 
 // ReadPipelineManifest returns the contents of the pipeline manifest under the given path.
 func (ws *Workspace) ReadPipelineManifest(path string) (*manifest.Pipeline, error) {
-	manifestExists, err := ws.fsUtils.Exists(path)
+	manifestExists, err := ws.fs.Exists(path)
 	if err != nil {
 		return nil, err
 	}
 	if !manifestExists {
 		return nil, ErrNoPipelineInWorkspace
 	}
-	data, err := ws.fsUtils.ReadFile(path)
+	data, err := ws.fs.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read pipeline manifest: %w", err)
 	}
@@ -326,30 +372,40 @@ func (ws *Workspace) WriteJobManifest(marshaler encoding.BinaryMarshaler, name s
 	return ws.write(data, name, manifestFileName)
 }
 
-// WritePipelineBuildspec writes the pipeline buildspec under the copilot/ directory.
+// WritePipelineBuildspec writes the pipeline buildspec under the copilot/pipelines/{name}/ directory.
 // If successful returns the full path of the file, otherwise returns an empty string and the error.
-func (ws *Workspace) WritePipelineBuildspec(marshaler encoding.BinaryMarshaler) (string, error) {
+func (ws *Workspace) WritePipelineBuildspec(marshaler encoding.BinaryMarshaler, name string) (string, error) {
 	data, err := marshaler.MarshalBinary()
 	if err != nil {
 		return "", fmt.Errorf("marshal pipeline buildspec to binary: %w", err)
 	}
-	return ws.write(data, buildspecFileName)
+	return ws.write(data, pipelinesDirName, name, buildspecFileName)
 }
 
-// WritePipelineManifest writes the pipeline manifest under the copilot directory.
+// WritePipelineManifest writes the pipeline manifest under the copilot/pipelines/{name}/ directory.
 // If successful returns the full path of the file, otherwise returns an empty string and the error.
-func (ws *Workspace) WritePipelineManifest(marshaler encoding.BinaryMarshaler) (string, error) {
+func (ws *Workspace) WritePipelineManifest(marshaler encoding.BinaryMarshaler, name string) (string, error) {
 	data, err := marshaler.MarshalBinary()
 	if err != nil {
 		return "", fmt.Errorf("marshal pipeline manifest to binary: %w", err)
 	}
-	return ws.write(data, pipelineFileName)
+	return ws.write(data, pipelinesDirName, name, manifestFileName)
+}
+
+// WriteEnvironmentManifest writes the environment manifest under the copilot/environments/{name}/ directory.
+// If successful returns the full path of the file, otherwise returns an empty string and the error.
+func (ws *Workspace) WriteEnvironmentManifest(marshaler encoding.BinaryMarshaler, name string) (string, error) {
+	data, err := marshaler.MarshalBinary()
+	if err != nil {
+		return "", fmt.Errorf("marshal environment manifest to binary: %w", err)
+	}
+	return ws.write(data, environmentsDirName, name, manifestFileName)
 }
 
 // DeleteWorkspaceFile removes the .workspace file under copilot/ directory.
 // This will be called during app delete, we do not want to delete any other generated files.
 func (ws *Workspace) DeleteWorkspaceFile() error {
-	return ws.fsUtils.Remove(filepath.Join(CopilotDirName, SummaryFileName))
+	return ws.fs.Remove(filepath.Join(CopilotDirName, SummaryFileName))
 }
 
 // ReadAddonsDir returns a list of file names under a service's "addons/" directory.
@@ -360,7 +416,7 @@ func (ws *Workspace) ReadAddonsDir(svcName string) ([]string, error) {
 	}
 
 	var names []string
-	files, err := ws.fsUtils.ReadDir(filepath.Join(copilotPath, svcName, addonsDirName))
+	files, err := ws.fs.ReadDir(filepath.Join(copilotPath, svcName, addonsDirName))
 	if err != nil {
 		return nil, err
 	}
@@ -397,13 +453,13 @@ func IsInGitRepository(fs FileStat) bool {
 	return !os.IsNotExist(err)
 }
 
-// PipelineManifestLegacyPath returns the path to pipeline manifests before multiple pipelines (and the copilot/pipelines/ dir) were enabled.
-func (ws *Workspace) PipelineManifestLegacyPath() (string, error) {
+// pipelineManifestLegacyPath returns the path to pipeline manifests before multiple pipelines (and the copilot/pipelines/ dir) were enabled.
+func (ws *Workspace) pipelineManifestLegacyPath() (string, error) {
 	copilotPath, err := ws.copilotDirPath()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(copilotPath, pipelineFileName), nil
+	return filepath.Join(copilotPath, legacyPipelineFileName), nil
 }
 
 func (ws *Workspace) writeSummary(appName string) error {
@@ -421,7 +477,7 @@ func (ws *Workspace) writeSummary(appName string) error {
 	if err != nil {
 		return err
 	}
-	return ws.fsUtils.WriteFile(summaryPath, serializedWorkspaceSummary, 0644)
+	return ws.fs.WriteFile(summaryPath, serializedWorkspaceSummary, 0644)
 }
 
 func (ws *Workspace) pipelinesDirPath() (string, error) {
@@ -447,7 +503,7 @@ func (ws *Workspace) createCopilotDir() error {
 	if existingWorkspace != "" {
 		return nil
 	}
-	return ws.fsUtils.Mkdir(CopilotDirName, 0755)
+	return ws.fs.Mkdir(CopilotDirName, 0755)
 }
 
 // Path returns the absolute path to the workspace.
@@ -457,6 +513,15 @@ func (ws *Workspace) Path() (string, error) {
 		return "", err
 	}
 	return filepath.Dir(copilotDirPath), nil
+}
+
+// Rel returns the path relative to the workspace root.
+func (ws *Workspace) Rel(fullPath string) (string, error) {
+	copiDir, err := ws.copilotDirPath()
+	if err != nil {
+		return "", fmt.Errorf("get path to Copilot dir: %w", err)
+	}
+	return filepath.Rel(filepath.Dir(copiDir), fullPath)
 }
 
 func (ws *Workspace) copilotDirPath() (string, error) {
@@ -473,7 +538,7 @@ func (ws *Workspace) copilotDirPath() (string, error) {
 	searchingDir := ws.workingDir
 	for try := 0; try < maximumParentDirsToSearch; try++ {
 		currentDirectoryPath := filepath.Join(searchingDir, CopilotDirName)
-		inCurrentDirPath, err := ws.fsUtils.DirExists(currentDirectoryPath)
+		inCurrentDirPath, err := ws.fs.DirExists(currentDirectoryPath)
 		if err != nil {
 			return "", err
 		}
@@ -499,17 +564,17 @@ func (ws *Workspace) write(data []byte, elem ...string) (string, error) {
 	pathElems := append([]string{copilotPath}, elem...)
 	filename := filepath.Join(pathElems...)
 
-	if err := ws.fsUtils.MkdirAll(filepath.Dir(filename), 0755 /* -rwxr-xr-x */); err != nil {
+	if err := ws.fs.MkdirAll(filepath.Dir(filename), 0755 /* -rwxr-xr-x */); err != nil {
 		return "", fmt.Errorf("create directories for file %s: %w", filename, err)
 	}
-	exist, err := ws.fsUtils.Exists(filename)
+	exist, err := ws.fs.Exists(filename)
 	if err != nil {
 		return "", fmt.Errorf("check if manifest file %s exists: %w", filename, err)
 	}
 	if exist {
 		return "", &ErrFileExists{FileName: filename}
 	}
-	if err := ws.fsUtils.WriteFile(filename, data, 0644 /* -rw-r--r-- */); err != nil {
+	if err := ws.fs.WriteFile(filename, data, 0644 /* -rw-r--r-- */); err != nil {
 		return "", fmt.Errorf("write manifest file: %w", err)
 	}
 	return filename, nil
@@ -523,21 +588,21 @@ func (ws *Workspace) read(elem ...string) ([]byte, error) {
 	}
 	pathElems := append([]string{copilotPath}, elem...)
 	filename := filepath.Join(pathElems...)
-	exist, err := ws.fsUtils.Exists(filename)
+	exist, err := ws.fs.Exists(filename)
 	if err != nil {
 		return nil, fmt.Errorf("check if manifest file %s exists: %w", filename, err)
 	}
 	if !exist {
 		return nil, &ErrFileNotExists{FileName: filename}
 	}
-	return ws.fsUtils.ReadFile(filename)
+	return ws.fs.ReadFile(filename)
 }
 
 // ListDockerfiles returns the list of Dockerfiles within the current
 // working directory and a sub-directory level below. If an error occurs while
 // reading directories, or no Dockerfiles found returns the error.
 func (ws *Workspace) ListDockerfiles() ([]string, error) {
-	wdFiles, err := ws.fsUtils.ReadDir(ws.workingDir)
+	wdFiles, err := ws.fs.ReadDir(ws.workingDir)
 	if err != nil {
 		return nil, fmt.Errorf("read directory: %w", err)
 	}
@@ -554,7 +619,7 @@ func (ws *Workspace) ListDockerfiles() ([]string, error) {
 		}
 
 		// Add sub-directories containing a Dockerfile one level below current directory.
-		subFiles, err := ws.fsUtils.ReadDir(wdFile.Name())
+		subFiles, err := ws.fs.ReadDir(wdFile.Name())
 		if err != nil {
 			// swallow errors for unreadable directories
 			continue
@@ -575,25 +640,55 @@ func (ws *Workspace) ListDockerfiles() ([]string, error) {
 	return dockerfiles, nil
 }
 
+func (ws *Workspace) manifestNameMatchWithDir(mft namedManifest, mftDirName string) error {
+	mftName, err := mft.name()
+	if err != nil {
+		return err
+	}
+	if mftName != mftDirName {
+		return fmt.Errorf("name of the manifest %q and directory %q do not match", mftName, mftDirName)
+	}
+	return nil
+}
+
 // WorkloadManifest represents raw local workload manifest.
 type WorkloadManifest []byte
 
-func (w WorkloadManifest) workloadName() (string, error) {
+func (w WorkloadManifest) name() (string, error) {
+	return retrieveNameFromManifest(w)
+}
+
+// WorkloadType returns the workload type of the manifest.
+func (w WorkloadManifest) WorkloadType() (string, error) {
+	return retrieveTypeFromManifest(w)
+}
+
+// EnvironmentManifest represents raw local environment manifest.
+type EnvironmentManifest []byte
+
+func (e EnvironmentManifest) name() (string, error) {
+	return retrieveNameFromManifest(e)
+}
+
+type namedManifest interface {
+	name() (string, error)
+}
+
+func retrieveNameFromManifest(in []byte) (string, error) {
 	wl := struct {
 		Name string `yaml:"name"`
 	}{}
-	if err := yaml.Unmarshal(w, &wl); err != nil {
+	if err := yaml.Unmarshal(in, &wl); err != nil {
 		return "", fmt.Errorf(`unmarshal manifest file to retrieve "name": %w`, err)
 	}
 	return wl.Name, nil
 }
 
-// WorkloadType returns the workload type of the manifest.
-func (w WorkloadManifest) WorkloadType() (string, error) {
+func retrieveTypeFromManifest(in []byte) (string, error) {
 	wl := struct {
 		Type string `yaml:"type"`
 	}{}
-	if err := yaml.Unmarshal(w, &wl); err != nil {
+	if err := yaml.Unmarshal(in, &wl); err != nil {
 		return "", fmt.Errorf(`unmarshal manifest file to retrieve "type": %w`, err)
 	}
 	return wl.Type, nil

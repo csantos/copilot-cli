@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/dustin/go-humanize/english"
 )
 
@@ -19,14 +20,14 @@ func (e *ErrInvalidWorkloadType) Error() string {
 	return fmt.Sprintf("invalid manifest type: %s", e.Type)
 }
 
-// ErrInvalidPipelineManifestVersion occurs when the pipeline.yml file
+// ErrInvalidPipelineManifestVersion occurs when the pipeline.yml/manifest.yml file
 // contains invalid schema version during unmarshalling.
 type ErrInvalidPipelineManifestVersion struct {
 	invalidVersion PipelineSchemaMajorVersion
 }
 
 func (e *ErrInvalidPipelineManifestVersion) Error() string {
-	return fmt.Sprintf("pipeline.yml contains invalid schema version: %d", e.invalidVersion)
+	return fmt.Sprintf("pipeline manifest contains invalid schema version: %d", e.invalidVersion)
 }
 
 // Is compares the 2 errors. Only returns true if the errors are of the same
@@ -60,12 +61,22 @@ type errFieldMustBeSpecified struct {
 }
 
 func (e *errFieldMustBeSpecified) Error() string {
-	errMsg := fmt.Sprintf(`"%s" must be specified`, e.missingField)
+	errMsg := fmt.Sprintf(`%q must be specified`, e.missingField)
 	if len(e.conditionalFields) == 0 {
 		return errMsg
 	}
-	return fmt.Sprintf(`%s if "%s" %s specified`, errMsg, english.WordSeries(e.conditionalFields, "or"),
+	return fmt.Sprintf(`%s if %s %s specified`, errMsg, english.WordSeries(quoteStringSlice(e.conditionalFields), "or"),
 		english.PluralWord(len(e.conditionalFields), "is", "are"))
+}
+
+type errInvalidAutoscalingFieldsWithWkldType struct {
+	invalidFields []string
+	workloadType  string
+}
+
+func (e *errInvalidAutoscalingFieldsWithWkldType) Error() string {
+	return fmt.Sprintf("autoscaling %v %v %v invalid with workload type %v", english.PluralWord(len(e.invalidFields), "field", "fields"),
+		english.WordSeries(template.QuoteSliceFunc(e.invalidFields), "and"), english.PluralWord(len(e.invalidFields), "is", "are"), e.workloadType)
 }
 
 type errFieldMutualExclusive struct {
@@ -96,13 +107,17 @@ type errAtLeastOneFieldMustBeSpecified struct {
 }
 
 func (e *errAtLeastOneFieldMustBeSpecified) Error() string {
-	quotedFields := make([]string, len(e.missingFields))
-	for i, f := range e.missingFields {
-		quotedFields[i] = strconv.Quote(f)
-	}
-	errMsg := fmt.Sprintf("must specify at least one of %s", english.WordSeries(quotedFields, "or"))
+	errMsg := fmt.Sprintf("must specify at least one of %s", english.WordSeries(quoteStringSlice(e.missingFields), "or"))
 	if e.conditionalField != "" {
 		errMsg = fmt.Sprintf(`%s if "%s" is specified`, errMsg, e.conditionalField)
 	}
 	return errMsg
+}
+
+func quoteStringSlice(in []string) []string {
+	quoted := make([]string, len(in))
+	for idx, str := range in {
+		quoted[idx] = strconv.Quote(str)
+	}
+	return quoted
 }

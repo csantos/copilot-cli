@@ -4,12 +4,11 @@
 package manifest
 
 import (
-	"io/ioutil"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
@@ -71,7 +70,9 @@ func TestNewWorkerSvc(t *testing.T) {
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement: &PublicSubnetPlacement,
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
 						},
 					},
 				},
@@ -112,7 +113,9 @@ func TestNewWorkerSvc(t *testing.T) {
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement: &PublicSubnetPlacement,
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
 						},
 					},
 				},
@@ -135,76 +138,11 @@ func TestNewWorkerSvc(t *testing.T) {
 	}
 }
 
-func TestWorkerSvc_MarshalBinary(t *testing.T) {
-	testCases := map[string]struct {
-		inProps WorkerServiceProps
-
-		wantedTestdata string
-	}{
-		"without subscribe": {
-			inProps: WorkerServiceProps{
-				WorkloadProps: WorkloadProps{
-					Name:       "testers",
-					Dockerfile: "./testers/Dockerfile",
-				},
-				Platform: PlatformArgsOrString{
-					PlatformString: nil,
-					PlatformArgs: PlatformArgs{
-						OSFamily: nil,
-						Arch:     nil,
-					},
-				},
-			},
-			wantedTestdata: "worker-svc-nosubscribe.yml",
-		},
-		"with subscribe": {
-			inProps: WorkerServiceProps{
-				WorkloadProps: WorkloadProps{
-					Name:       "testers",
-					Dockerfile: "./testers/Dockerfile",
-				},
-				Platform: PlatformArgsOrString{
-					PlatformString: nil,
-					PlatformArgs: PlatformArgs{
-						OSFamily: nil,
-						Arch:     nil,
-					},
-				},
-				Topics: []TopicSubscription{
-					{
-						Name:    aws.String("testTopic"),
-						Service: aws.String("service4TestTopic"),
-					},
-					{
-						Name:    aws.String("testTopic2"),
-						Service: aws.String("service4TestTopic2"),
-					},
-				},
-			},
-			wantedTestdata: "worker-svc-subscribe.yml",
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			// GIVEN
-			path := filepath.Join("testdata", tc.wantedTestdata)
-			wantedBytes, err := ioutil.ReadFile(path)
-			require.NoError(t, err)
-			manifest := NewWorkerService(tc.inProps)
-
-			// WHEN
-			tpl, err := manifest.MarshalBinary()
-			require.NoError(t, err)
-
-			// THEN
-			require.Equal(t, string(wantedBytes), string(tpl))
-		})
-	}
-}
-
 func TestWorkerSvc_ApplyEnv(t *testing.T) {
-	mockPerc := Percentage(70)
+	perc := Percentage(70)
+	mockConfig := ScalingConfigOrT[Percentage]{
+		Value: &perc,
+	}
 	mockWorkerServiceWithNoEnvironments := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
@@ -310,7 +248,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 				TaskConfig: TaskConfig{
 					Count: Count{
 						AdvancedCount: AdvancedCount{
-							CPU: &mockPerc,
+							CPU: mockConfig,
 						},
 					},
 					CPU: aws.Int(512),
@@ -685,7 +623,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 						Memory: aws.Int(256),
 						Count: Count{
 							AdvancedCount: AdvancedCount{
-								CPU: &mockPerc,
+								CPU: mockConfig,
 							},
 						},
 						Variables: map[string]string{
@@ -1010,7 +948,10 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 
 func TestWorkerSvc_ApplyEnv_CountOverrides(t *testing.T) {
 	mockRange := IntRangeBand("1-10")
-	mockPerc := Percentage(80)
+	perc := Percentage(70)
+	mockConfig := ScalingConfigOrT[Percentage]{
+		Value: &perc,
+	}
 	testCases := map[string]struct {
 		svcCount Count
 		envCount Count
@@ -1021,7 +962,7 @@ func TestWorkerSvc_ApplyEnv_CountOverrides(t *testing.T) {
 			svcCount: Count{
 				AdvancedCount: AdvancedCount{
 					Range: Range{Value: &mockRange},
-					CPU:   &mockPerc,
+					CPU:   mockConfig,
 				},
 			},
 			envCount: Count{},
@@ -1031,7 +972,7 @@ func TestWorkerSvc_ApplyEnv_CountOverrides(t *testing.T) {
 						Count: Count{
 							AdvancedCount: AdvancedCount{
 								Range: Range{Value: &mockRange},
-								CPU:   &mockPerc,
+								CPU:   mockConfig,
 							},
 						},
 					},
@@ -1250,6 +1191,78 @@ func TestSQSQueueOrBool_UnmarshalYAML(t *testing.T) {
 				require.Equal(t, tc.wantedStruct.Advanced.Retention, sc.Queue.Advanced.Retention)
 				require.Equal(t, tc.wantedStruct.Advanced.Timeout, sc.Queue.Advanced.Timeout)
 			}
+		})
+	}
+}
+
+func TestWorkerService_RequiredEnvironmentFeatures(t *testing.T) {
+	testCases := map[string]struct {
+		mft    func(svc *WorkerService)
+		wanted []string
+	}{
+		"no feature required by default": {
+			mft: func(svc *WorkerService) {},
+		},
+		"nat feature required": {
+			mft: func(svc *WorkerService) {
+				svc.Network = NetworkConfig{
+					VPC: vpcConfig{
+						Placement: PlacementArgOrString{
+							PlacementString: placementStringP(PrivateSubnetPlacement),
+						},
+					},
+				}
+			},
+			wanted: []string{template.NATFeatureName},
+		},
+		"efs feature required by enabling managed volume": {
+			mft: func(svc *WorkerService) {
+				svc.Storage = Storage{
+					Volumes: map[string]*Volume{
+						"mock-managed-volume-1": {
+							EFS: EFSConfigOrBool{
+								Enabled: aws.Bool(true),
+							},
+						},
+						"mock-imported-volume": {
+							EFS: EFSConfigOrBool{
+								Advanced: EFSVolumeConfiguration{
+									FileSystemID: aws.String("mock-id"),
+								},
+							},
+						},
+					},
+				}
+			},
+			wanted: []string{template.EFSFeatureName},
+		},
+		"efs feature not required because storage is imported": {
+			mft: func(svc *WorkerService) {
+				svc.Storage = Storage{
+					Volumes: map[string]*Volume{
+						"mock-imported-volume": {
+							EFS: EFSConfigOrBool{
+								Advanced: EFSVolumeConfiguration{
+									FileSystemID: aws.String("mock-id"),
+								},
+							},
+						},
+					},
+				}
+			},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			inSvc := WorkerService{
+				Workload: Workload{
+					Name: aws.String("mock-svc"),
+					Type: aws.String(WorkerServiceType),
+				},
+			}
+			tc.mft(&inSvc)
+			got := inSvc.RequiredEnvironmentFeatures()
+			require.Equal(t, tc.wanted, got)
 		})
 	}
 }

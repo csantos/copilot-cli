@@ -7,13 +7,11 @@ package s3
 import (
 	"archive/zip"
 	"bytes"
-	"crypto/sha256"
 	"fmt"
 	"io"
-	"path"
-	"strconv"
 	"strings"
-	"time"
+
+	"github.com/aws/aws-sdk-go/aws/endpoints"
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
 
@@ -23,10 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 )
 
-const (
-	artifactDirName = "manual"
-	notFound        = "NotFound"
-)
+const notFound = "NotFound"
 
 type s3ManagerAPI interface {
 	Upload(input *s3manager.UploadInput, options ...func(*s3manager.Uploader)) (*s3manager.UploadOutput, error)
@@ -62,6 +57,8 @@ func New(s *session.Session) *S3 {
 }
 
 // ZipAndUpload zips all files and uploads the zipped file to an S3 bucket under the specified key.
+// Per s3's recommendation https://docs.aws.amazon.com/AmazonS3/latest/userguide/about-object-ownership.html:
+// The bucket owner, in addition to the object owner, is granted full control.
 func (s *S3) ZipAndUpload(bucket, key string, files ...NamedBinary) (string, error) {
 	buf := new(bytes.Buffer)
 	w := zip.NewWriter(buf)
@@ -82,19 +79,10 @@ func (s *S3) ZipAndUpload(bucket, key string, files ...NamedBinary) (string, err
 }
 
 // Upload uploads a file to an S3 bucket under the specified key.
+// Per s3's recommendation https://docs.aws.amazon.com/AmazonS3/latest/userguide/about-object-ownership.html:
+// The bucket owner, in addition to the object owner, is granted full control.
 func (s *S3) Upload(bucket, key string, data io.Reader) (string, error) {
 	return s.upload(bucket, key, data)
-}
-
-// MkdirTimestamp prefixes the key with the current timestamp "manual/<timestamp>/key".
-func MkdirTimestamp(key string) string {
-	id := time.Now().Unix()
-	return path.Join(artifactDirName, strconv.FormatInt(id, 10), key)
-}
-
-// MkdirSHA prefixes the key with the SHA256 hash of the contents of "manual/<hash>/key".
-func MkdirSHA256(key string, content []byte) string {
-	return path.Join(artifactDirName, fmt.Sprintf("%x", sha256.Sum256(content)), key)
 }
 
 // EmptyBucket deletes all objects within the bucket.
@@ -169,6 +157,19 @@ func ParseURL(url string) (bucket string, key string, err error) {
 	return
 }
 
+// URL returns a virtual-hosted–style S3 url for the object stored at key in a bucket created in the specified region.
+func URL(region, bucket, key string) string {
+	tld := "com"
+	for cn := range endpoints.AwsCnPartition().Regions() {
+		if cn == region {
+			tld = "cn"
+			break
+		}
+	}
+
+	return fmt.Sprintf("https://%s.s3.%s.amazonaws.%s/%s", bucket, region, tld, key)
+}
+
 // FormatARN formats an S3 object ARN.
 // For example: arn:aws:s3:::stackset-myapp-infrastru-pipelinebuiltartifactbuc-1nk5t9zkymh8r.s3-us-west-2.amazonaws.com/scripts/dns-cert-validator/dd2278811c3
 func FormatARN(partition, location string) string {
@@ -192,11 +193,13 @@ func (s *S3) isBucketExists(bucket string) (bool, error) {
 }
 
 func (s *S3) upload(bucket, key string, buf io.Reader) (string, error) {
-	resp, err := s.s3Manager.Upload(&s3manager.UploadInput{
+	in := &s3manager.UploadInput{
 		Body:   buf,
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
-	})
+		ACL:    aws.String(s3.ObjectCannedACLBucketOwnerFullControl),
+	}
+	resp, err := s.s3Manager.Upload(in)
 	if err != nil {
 		return "", fmt.Errorf("upload %s to bucket %s: %w", key, bucket, err)
 	}

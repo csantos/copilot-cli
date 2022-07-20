@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/cloudformation"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
+	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/stretchr/testify/require"
@@ -27,12 +28,26 @@ func TestAutoscalingIntegration_Validate(t *testing.T) {
 	require.NoError(t, err)
 	v, ok := mft.(*manifest.LoadBalancedWebService)
 	require.Equal(t, ok, true)
-	serializer, err := stack.NewLoadBalancedWebService(v, envName, appName, stack.RuntimeConfig{
-		Image: &stack.ECRImage{
-			RepoURL:  imageURL,
-			ImageTag: imageTag,
+	serializer, err := stack.NewLoadBalancedWebService(stack.LoadBalancedWebServiceConfig{
+		App: &config.Application{Name: appName},
+		EnvManifest: &manifest.Environment{
+			Workload: manifest.Workload{
+				Name: &envName,
+			},
 		},
-		ServiceDiscoveryEndpoint: "test.app.local",
+		Manifest: v,
+		RuntimeConfig: stack.RuntimeConfig{
+			Image: &stack.ECRImage{
+				RepoURL:  imageURL,
+				ImageTag: imageTag,
+			},
+			ServiceDiscoveryEndpoint: "test.app.local",
+			CustomResourcesURL: map[string]string{
+				"EnvControllerFunction":       "https://my-bucket.s3.us-west-2.amazonaws.com/code.zip",
+				"DynamicDesiredCountFunction": "https://my-bucket.s3.us-west-2.amazonaws.com/code.zip",
+				"RulePriorityFunction":        "https://my-bucket.s3.us-west-2.amazonaws.com/code.zip",
+			},
+		},
 	})
 	require.NoError(t, err)
 	tpl, err := serializer.Template()
@@ -57,8 +72,16 @@ func TestScheduledJob_Validate(t *testing.T) {
 	require.NoError(t, err)
 	v, ok := mft.(*manifest.ScheduledJob)
 	require.True(t, ok)
-	serializer, err := stack.NewScheduledJob(v, envName, appName, stack.RuntimeConfig{
-		ServiceDiscoveryEndpoint: "test.app.local",
+	serializer, err := stack.NewScheduledJob(stack.ScheduledJobConfig{
+		App:      appName,
+		Env:      envName,
+		Manifest: v,
+		RuntimeConfig: stack.RuntimeConfig{
+			ServiceDiscoveryEndpoint: "test.app.local",
+			CustomResourcesURL: map[string]string{
+				"EnvControllerFunction": "https://my-bucket.s3.us-west-2.amazonaws.com/code.zip",
+			},
+		},
 	})
 
 	tpl, err := serializer.Template()

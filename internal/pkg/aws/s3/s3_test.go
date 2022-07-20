@@ -58,6 +58,7 @@ func TestS3_ZipAndUpload(t *testing.T) {
 					}
 					require.Equal(t, aws.StringValue(in.Bucket), "mockBucket")
 					require.Equal(t, aws.StringValue(in.Key), "mockFileName")
+					require.Equal(t, s3.ObjectCannedACLBucketOwnerFullControl, aws.StringValue(in.ACL))
 				}).Return(&s3manager.UploadOutput{
 					Location: "mockURL",
 				}, nil)
@@ -116,6 +117,7 @@ func TestS3_Upload(t *testing.T) {
 					require.Equal(t, "bar", string(b))
 					require.Equal(t, "mockBucket", aws.StringValue(in.Bucket))
 					require.Equal(t, "mockFileName", aws.StringValue(in.Key))
+					require.Equal(t, s3.ObjectCannedACLBucketOwnerFullControl, aws.StringValue(in.ACL))
 				}).Return(&s3manager.UploadOutput{
 					Location: "mockURL",
 				}, nil)
@@ -403,6 +405,38 @@ func TestS3_ParseURL(t *testing.T) {
 				require.Equal(t, gotBucketName, tc.wantedBucketName)
 				require.Equal(t, gotKey, tc.wantedKey)
 			}
+		})
+	}
+}
+
+func TestURL(t *testing.T) {
+	testCases := map[string]struct {
+		region string
+		bucket string
+		key    string
+
+		wanted string
+	}{
+		// See https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-bucket-intro.html#virtual-host-style-url-ex
+		"Formats a virtual-hosted-style URL": {
+			region: "us-west-2",
+			bucket: "mybucket",
+			key:    "puppy.jpg",
+
+			wanted: "https://mybucket.s3.us-west-2.amazonaws.com/puppy.jpg",
+		},
+		"Formats the URL for a region in the aws-cn partition": {
+			region: "cn-north-1",
+			bucket: "mybucket",
+			key:    "puppy.jpg",
+
+			wanted: "https://mybucket.s3.cn-north-1.amazonaws.cn/puppy.jpg",
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tc.wanted, URL(tc.region, tc.bucket, tc.key))
 		})
 	}
 }

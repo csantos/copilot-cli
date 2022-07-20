@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v3"
 )
 
 func TestTemplate_ParseSvc(t *testing.T) {
@@ -47,6 +46,8 @@ func TestTemplate_ParseSvc(t *testing.T) {
 					"templates/workloads/partials/cf/eventrule.yml":                       []byte("eventrule"),
 					"templates/workloads/partials/cf/state-machine.yml":                   []byte("state-machine"),
 					"templates/workloads/partials/cf/efs-access-point.yml":                []byte("efs-access-point"),
+					"templates/workloads/partials/cf/https-listener.yml":                  []byte("https-listener"),
+					"templates/workloads/partials/cf/http-listener.yml":                   []byte("http-listener"),
 					"templates/workloads/partials/cf/env-controller.yml":                  []byte("env-controller"),
 					"templates/workloads/partials/cf/mount-points.yml":                    []byte("mount-points"),
 					"templates/workloads/partials/cf/volumes.yml":                         []byte("volumes"),
@@ -57,6 +58,7 @@ func TestTemplate_ParseSvc(t *testing.T) {
 					"templates/workloads/partials/cf/subscribe.yml":                       []byte("subscribe"),
 					"templates/workloads/partials/cf/nlb.yml":                             []byte("nlb"),
 					"templates/workloads/partials/cf/vpc-connector.yml":                   []byte("vpc-connector"),
+					"templates/workloads/partials/cf/alb.yml":                             []byte("alb"),
 				}
 			},
 			wantedContent: `  loggroup
@@ -77,6 +79,8 @@ func TestTemplate_ParseSvc(t *testing.T) {
   state-machine
   state-machine-definition
   efs-access-point
+  https-listener
+  http-listener
   env-controller
   mount-points
   volumes
@@ -87,6 +91,7 @@ func TestTemplate_ParseSvc(t *testing.T) {
   subscribe
   nlb
   vpc-connector
+  alb
 `,
 		},
 	}
@@ -147,85 +152,6 @@ func TestHasSecrets(t *testing.T) {
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			require.Equal(t, tc.wanted, hasSecrets(tc.in))
-		})
-	}
-}
-
-func TestTemplate_ParseNetwork(t *testing.T) {
-	type cfn struct {
-		Resources struct {
-			Service struct {
-				Properties struct {
-					NetworkConfiguration map[interface{}]interface{} `yaml:"NetworkConfiguration"`
-				} `yaml:"Properties"`
-			} `yaml:"Service"`
-		} `yaml:"Resources"`
-	}
-
-	testCases := map[string]struct {
-		input NetworkOpts
-
-		wantedNetworkConfig string
-	}{
-		"should render AWS VPC configuration for private subnets": {
-			input: NetworkOpts{
-				AssignPublicIP: "DISABLED",
-				SubnetsType:    "PrivateSubnets",
-			},
-			wantedNetworkConfig: `
- AwsvpcConfiguration:
-   AssignPublicIp: DISABLED
-   Subnets:
-     Fn::Split:
-       - ','
-       - Fn::ImportValue: !Sub '${AppName}-${EnvName}-PrivateSubnets'
-   SecurityGroups:
-     - Fn::ImportValue: !Sub '${AppName}-${EnvName}-EnvironmentSecurityGroup'
-`,
-		},
-		"should render AWS VPC configuration for private subnets with security groups": {
-			input: NetworkOpts{
-				AssignPublicIP: "DISABLED",
-				SubnetsType:    "PrivateSubnets",
-				SecurityGroups: []string{
-					"sg-1bcf1d5b",
-					"sg-asdasdas",
-				},
-			},
-			wantedNetworkConfig: `
- AwsvpcConfiguration:
-   AssignPublicIp: DISABLED
-   Subnets:
-     Fn::Split:
-       - ','
-       - Fn::ImportValue: !Sub '${AppName}-${EnvName}-PrivateSubnets'
-   SecurityGroups:
-     - Fn::ImportValue: !Sub '${AppName}-${EnvName}-EnvironmentSecurityGroup'
-     - "sg-1bcf1d5b"
-     - "sg-asdasdas"
-`,
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			// GIVEN
-			tpl := New()
-			wanted := make(map[interface{}]interface{})
-			err := yaml.Unmarshal([]byte(tc.wantedNetworkConfig), &wanted)
-			require.NoError(t, err, "unmarshal wanted config")
-
-			// WHEN
-			content, err := tpl.ParseLoadBalancedWebService(WorkloadOpts{
-				Network: tc.input,
-			})
-
-			// THEN
-			require.NoError(t, err, "parse load balanced web service")
-			var actual cfn
-			err = yaml.Unmarshal(content.Bytes(), &actual)
-			require.NoError(t, err, "unmarshal actual config")
-			require.Equal(t, wanted, actual.Resources.Service.Properties.NetworkConfiguration)
 		})
 	}
 }

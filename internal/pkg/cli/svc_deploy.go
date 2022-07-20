@@ -5,17 +5,20 @@ package cli
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
-
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
 	"github.com/aws/copilot-cli/internal/pkg/aws/tags"
+	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
+	"github.com/aws/copilot-cli/internal/pkg/template"
 
 	"github.com/spf13/cobra"
 
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
-	"github.com/aws/copilot-cli/internal/pkg/cli/deploy"
+	clideploy "github.com/aws/copilot-cli/internal/pkg/cli/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/describe"
 	"github.com/aws/copilot-cli/internal/pkg/exec"
@@ -29,12 +32,13 @@ import (
 )
 
 type deployWkldVars struct {
-	appName        string
-	name           string
-	envName        string
-	imageTag       string
-	resourceTags   map[string]string
-	forceNewUpdate bool
+	appName         string
+	name            string
+	envName         string
+	imageTag        string
+	resourceTags    map[string]string
+	forceNewUpdate  bool // NOTE: this variable is not applicable for a job workload currently.
+	disableRollback bool
 
 	// To facilitate unit tests.
 	clientConfigured bool
@@ -43,14 +47,14 @@ type deployWkldVars struct {
 type deploySvcOpts struct {
 	deployWkldVars
 
-	store           store
-	ws              wsWlDirReader
-	unmarshal       func([]byte) (manifest.WorkloadManifest, error)
-	newInterpolator func(app, env string) interpolator
-	cmd             runner
-	envUpgradeCmd   actionCommand
-	sessProvider    *sessions.Provider
-	newSvcDeployer  func(*deploySvcOpts) (workloadDeployer, error)
+	store                store
+	ws                   wsWlDirReader
+	unmarshal            func([]byte) (manifest.WorkloadManifest, error)
+	newInterpolator      func(app, env string) interpolator
+	cmd                  execRunner
+	sessProvider         *sessions.Provider
+	newSvcDeployer       func() (workloadDeployer, error)
+	envFeaturesDescriber versionCompatibilityChecker
 
 	spinner progress
 	sel     wsSelector
@@ -62,7 +66,7 @@ type deploySvcOpts struct {
 	svcType         string
 	appliedManifest interface{}
 	rootUserARN     string
-	deployRecs      deploy.ActionRecommender
+	deployRecs      clideploy.ActionRecommender
 }
 
 func newSvcDeployOpts(vars deployWkldVars) (*deploySvcOpts, error) {
@@ -79,6 +83,7 @@ func newSvcDeployOpts(vars deployWkldVars) (*deploySvcOpts, error) {
 
 	store := config.NewSSMStore(identity.New(defaultSession), ssm.New(defaultSession), aws.StringValue(defaultSession.Config.Region))
 	prompter := prompt.New()
+
 	opts := &deploySvcOpts{
 		deployWkldVars: vars,
 
@@ -86,12 +91,15 @@ func newSvcDeployOpts(vars deployWkldVars) (*deploySvcOpts, error) {
 		ws:              ws,
 		unmarshal:       manifest.UnmarshalWorkload,
 		spinner:         termprogress.NewSpinner(log.DiagnosticWriter),
-		sel:             selector.NewWorkspaceSelect(prompter, store, ws),
+		sel:             selector.NewLocalWorkloadSelector(prompter, store, ws),
 		prompt:          prompter,
 		newInterpolator: newManifestInterpolator,
 		cmd:             exec.NewCmd(),
 		sessProvider:    sessProvider,
-		newSvcDeployer:  newSvcDeployer,
+	}
+	opts.newSvcDeployer = func() (workloadDeployer, error) {
+		// NOTE: Defined as a struct member to facilitate unit testing.
+		return newSvcDeployer(opts)
 	}
 	return opts, err
 }
@@ -101,24 +109,29 @@ func newSvcDeployer(o *deploySvcOpts) (workloadDeployer, error) {
 	if err != nil {
 		return nil, err
 	}
+	raw, err := o.ws.ReadWorkloadManifest(o.name)
+	if err != nil {
+		return nil, fmt.Errorf("read manifest file for %s: %w", o.name, err)
+	}
 	var deployer workloadDeployer
-	in := deploy.WorkloadDeployerInput{
+	in := clideploy.WorkloadDeployerInput{
 		SessionProvider: o.sessProvider,
 		Name:            o.name,
 		App:             targetApp,
 		Env:             o.targetEnv,
 		ImageTag:        o.imageTag,
 		Mft:             o.appliedManifest,
+		RawMft:          raw,
 	}
 	switch t := o.appliedManifest.(type) {
 	case *manifest.LoadBalancedWebService:
-		deployer, err = deploy.NewLBDeployer(&in)
+		deployer, err = clideploy.NewLBWSDeployer(&in)
 	case *manifest.BackendService:
-		deployer, err = deploy.NewBackendDeployer(&in)
+		deployer, err = clideploy.NewBackendDeployer(&in)
 	case *manifest.RequestDrivenWebService:
-		deployer, err = deploy.NewRDWSDeployer(&in)
+		deployer, err = clideploy.NewRDWSDeployer(&in)
 	case *manifest.WorkerService:
-		deployer, err = deploy.NewWorkerSvcDeployer(&in)
+		deployer, err = clideploy.NewWorkerSvcDeployer(&in)
 	default:
 		return nil, fmt.Errorf("unknown manifest type %T while creating the CloudFormation stack", t)
 	}
@@ -165,9 +178,6 @@ func (o *deploySvcOpts) Execute() error {
 			return err
 		}
 	}
-	if err := o.envUpgradeCmd.Execute(); err != nil {
-		return fmt.Errorf(`execute "env upgrade --app %s --name %s": %v`, o.appName, o.envName, err)
-	}
 	mft, err := workloadManifest(&workloadManifestInput{
 		name:         o.name,
 		appName:      o.appName,
@@ -180,9 +190,21 @@ func (o *deploySvcOpts) Execute() error {
 		return err
 	}
 	o.appliedManifest = mft
-	deployer, err := o.newSvcDeployer(o)
+	if err := validateWorkloadManifestCompatibilityWithEnv(o.ws, o.envFeaturesDescriber, mft, o.envName); err != nil {
+		return err
+	}
+	deployer, err := o.newSvcDeployer()
 	if err != nil {
 		return err
+	}
+	serviceInRegion, err := deployer.IsServiceAvailableInRegion(o.targetEnv.Region)
+	if err != nil {
+		return fmt.Errorf("check if %s is available in region %s: %w", o.svcType, o.targetEnv.Region, err)
+	}
+
+	if !serviceInRegion {
+		log.Warningf(`%s might not be available in region %s; proceed with caution.
+`, o.svcType, o.targetEnv.Region)
 	}
 	uploadOut, err := deployer.UploadArtifacts()
 	if err != nil {
@@ -192,17 +214,32 @@ func (o *deploySvcOpts) Execute() error {
 	if err != nil {
 		return err
 	}
-	deployRecs, err := deployer.DeployWorkload(&deploy.DeployWorkloadInput{
-		StackRuntimeConfiguration: deploy.StackRuntimeConfiguration{
-			ImageDigest: uploadOut.ImageDigest,
-			EnvFileARN:  uploadOut.EnvFileARN,
-			AddonsURL:   uploadOut.AddonsURL,
-			RootUserARN: o.rootUserARN,
-			Tags:        tags.Merge(targetApp.Tags, o.resourceTags),
+	deployRecs, err := deployer.DeployWorkload(&clideploy.DeployWorkloadInput{
+		StackRuntimeConfiguration: clideploy.StackRuntimeConfiguration{
+			ImageDigest:        uploadOut.ImageDigest,
+			EnvFileARN:         uploadOut.EnvFileARN,
+			AddonsURL:          uploadOut.AddonsURL,
+			RootUserARN:        o.rootUserARN,
+			Tags:               tags.Merge(targetApp.Tags, o.resourceTags),
+			CustomResourceURLs: uploadOut.CustomResourceURLs,
 		},
-		ForceNewUpdate: o.forceNewUpdate,
+		Options: clideploy.Options{
+			ForceNewUpdate:  o.forceNewUpdate,
+			DisableRollback: o.disableRollback,
+		},
 	})
 	if err != nil {
+		if o.disableRollback {
+			stackName := stack.NameForService(o.targetApp.Name, o.targetEnv.Name, o.name)
+			rollbackCmd := fmt.Sprintf("aws cloudformation rollback-stack --stack-name %s --role-arn %s", stackName, o.targetEnv.ExecutionRoleARN)
+			log.Infof(`It seems like you have disabled automatic stack rollback for this deployment. To debug, you can:
+* Run %s to inspect the service log.
+* Visit the AWS console to inspect the errors.
+After fixing the deployment, you can:
+1. Run %s to rollback the deployment.
+2. Run %s to make a new deployment.
+`, color.HighlightCode("copilot svc logs"), color.HighlightCode(rollbackCmd), color.HighlightCode("copilot svc deploy"))
+		}
 		return fmt.Errorf("deploy service %s to environment %s: %w", o.name, o.envName, err)
 	}
 	o.deployRecs = deployRecs
@@ -285,15 +322,6 @@ func (o *deploySvcOpts) configureClients() error {
 	}
 	o.svcType = svc.Type
 
-	cmd, err := newEnvUpgradeOpts(envUpgradeVars{
-		appName: o.appName,
-		name:    env.Name,
-	})
-	if err != nil {
-		return fmt.Errorf("new env upgrade command: %v", err)
-	}
-	o.envUpgradeCmd = cmd
-
 	// client to retrieve an application's resources created with CloudFormation.
 	defaultSess, err := o.sessProvider.Default()
 	if err != nil {
@@ -307,6 +335,15 @@ func (o *deploySvcOpts) configureClients() error {
 	}
 	o.rootUserARN = caller.RootUserARN
 
+	envDescriber, err := describe.NewEnvDescriber(describe.NewEnvDescriberConfig{
+		App:         o.appName,
+		Env:         o.envName,
+		ConfigStore: o.store,
+	})
+	if err != nil {
+		return err
+	}
+	o.envFeaturesDescriber = envDescriber
 	return nil
 }
 
@@ -319,7 +356,7 @@ type workloadManifestInput struct {
 	unmarshal    func([]byte) (manifest.WorkloadManifest, error)
 }
 
-func workloadManifest(in *workloadManifestInput) (interface{}, error) {
+func workloadManifest(in *workloadManifestInput) (manifest.WorkloadManifest, error) {
 	raw, err := in.ws.ReadWorkloadManifest(in.name)
 	if err != nil {
 		return nil, fmt.Errorf("read manifest file for %s: %w", in.name, err)
@@ -340,6 +377,40 @@ func workloadManifest(in *workloadManifestInput) (interface{}, error) {
 		return nil, fmt.Errorf("validate manifest against environment %s: %s", in.envName, err)
 	}
 	return envMft, nil
+}
+
+func validateWorkloadManifestCompatibilityWithEnv(ws wsEnvironmentsLister, env versionCompatibilityChecker, mft manifest.WorkloadManifest, envName string) error {
+	availableFeatures, err := env.AvailableFeatures()
+	if err != nil {
+		return fmt.Errorf("get available features of the %s environment stack: %w", envName, err)
+	}
+	exists := struct{}{}
+	available := make(map[string]struct{})
+	for _, f := range availableFeatures {
+		available[f] = exists
+	}
+
+	features := mft.RequiredEnvironmentFeatures()
+	for _, f := range features {
+		if _, ok := available[f]; !ok {
+			logMsg := fmt.Sprintf(`Your manifest configuration requires your environment %q to have the feature %q available.`, envName, template.FriendlyEnvFeatureName(f))
+			if v := template.LeastVersionForFeature(f); v != "" {
+				logMsg += fmt.Sprintf(` The least environment version that supports the feature is %s.`, v)
+			}
+			currVersion, err := env.Version()
+			if err == nil {
+				logMsg += fmt.Sprintf(" Your environment is on %s.", currVersion)
+			}
+			log.Errorln(logMsg)
+			return &errFeatureIncompatibleWithEnvironment{
+				ws:             ws,
+				missingFeature: f,
+				envName:        envName,
+				curVersion:     currVersion,
+			}
+		}
+	}
+	return nil
 }
 
 func (o *deploySvcOpts) uriRecommendedActions() ([]string, error) {
@@ -364,13 +435,16 @@ func (o *deploySvcOpts) uriRecommendedActions() ([]string, error) {
 	}
 
 	network := "over the internet."
-	if o.svcType == manifest.BackendServiceType {
+	switch uri.AccessType {
+	case describe.URIAccessTypeInternal:
+		network = "from your internal network."
+	case describe.URIAccessTypeServiceDiscovery:
 		network = "with service discovery."
 	}
-	recs := []string{
-		fmt.Sprintf("You can access your service at %s %s", color.HighlightResource(uri), network),
-	}
-	return recs, nil
+
+	return []string{
+		fmt.Sprintf("You can access your service at %s %s", color.HighlightResource(uri.URI), network),
+	}, nil
 }
 
 func (o *deploySvcOpts) publishRecommendedActions() []string {
@@ -405,6 +479,42 @@ func (o *deploySvcOpts) getTargetApp() (*config.Application, error) {
 	return o.targetApp, nil
 }
 
+type errFeatureIncompatibleWithEnvironment struct {
+	ws             wsEnvironmentsLister
+	missingFeature string
+	envName        string
+	curVersion     string
+}
+
+func (e *errFeatureIncompatibleWithEnvironment) Error() string {
+	if e.curVersion == "" {
+		return fmt.Sprintf("environment %q is not on a version that supports the %q feature", e.envName, template.FriendlyEnvFeatureName(e.missingFeature))
+	}
+	return fmt.Sprintf("environment %q is on version %q which does not support the %q feature", e.envName, e.curVersion, template.FriendlyEnvFeatureName(e.missingFeature))
+}
+
+// RecommendActions returns recommended actions to be taken after the error.
+// Implements main.actionRecommender interface.
+func (e *errFeatureIncompatibleWithEnvironment) RecommendActions() string {
+	envs, _ := e.ws.ListEnvironments() // Best effort try to detect if env manifest exists.
+	for _, env := range envs {
+		if e.envName == env {
+			return fmt.Sprintf("You can upgrade the %q environment template by running %s.", e.envName, color.HighlightCode(fmt.Sprintf("copilot env deploy --name %s", e.envName)))
+		}
+	}
+	msgs := []string{
+		"You can upgrade your environment template by running:",
+		fmt.Sprintf("1. Create the directory to store your environment manifest %s.",
+			color.HighlightCode(fmt.Sprintf("mkdir -p %s", filepath.Join("copilot", "environments", e.envName)))),
+		fmt.Sprintf("2. Generate the manifest %s.",
+			color.HighlightCode(fmt.Sprintf("copilot env show -n %s --manifest > %s", e.envName, filepath.Join("copilot", "environments", e.envName, "manifest.yml")))),
+		fmt.Sprintf("3. Deploy the environment stack %s.",
+			color.HighlightCode(fmt.Sprintf("copilot env deploy --name %s", e.envName))),
+	}
+	return strings.Join(msgs, "\n")
+
+}
+
 // buildSvcDeployCmd builds the `svc deploy` subcommand.
 func buildSvcDeployCmd() *cobra.Command {
 	vars := deployWkldVars{}
@@ -431,6 +541,7 @@ func buildSvcDeployCmd() *cobra.Command {
 	cmd.Flags().StringVar(&vars.imageTag, imageTagFlag, "", imageTagFlagDescription)
 	cmd.Flags().StringToStringVar(&vars.resourceTags, resourceTagsFlag, nil, resourceTagsFlagDescription)
 	cmd.Flags().BoolVar(&vars.forceNewUpdate, forceFlag, false, forceFlagDescription)
+	cmd.Flags().BoolVar(&vars.disableRollback, noRollbackFlag, false, noRollbackFlagDescription)
 
 	return cmd
 }

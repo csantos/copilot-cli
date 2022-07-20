@@ -72,7 +72,7 @@ func (o *resumeSvcOpts) Execute() error {
 	if err := o.initClients(); err != nil {
 		return err
 	}
-	svcARN, err := o.apprunnerDescriber.ServiceARN()
+	svcARN, err := o.apprunnerDescriber.ServiceARN(o.envName)
 	if err != nil {
 		return err
 	}
@@ -119,13 +119,13 @@ func (o *resumeSvcOpts) validateAndAskSvcEnvName() error {
 		svcResumeSvcNameHelpPrompt,
 		o.appName,
 		selector.WithEnv(o.envName),
-		selector.WithSvc(o.svcName),
+		selector.WithName(o.svcName),
 		selector.WithServiceTypesFilter([]string{manifest.RequestDrivenWebServiceType}),
 	)
 	if err != nil {
 		return fmt.Errorf("select deployed service for application %s: %w", o.appName, err)
 	}
-	o.svcName = deployedService.Svc
+	o.svcName = deployedService.Name
 	o.envName = deployedService.Env
 	return nil
 }
@@ -151,7 +151,7 @@ func newResumeSvcOpts(vars resumeSvcVars) (*resumeSvcOpts, error) {
 	}
 	opts.initClients = func() error {
 		var a *apprunner.AppRunner
-		var d *describe.AppRunnerServiceDescriber
+		var d *describe.RDWebServiceDescriber
 		env, err := configStore.GetEnvironment(opts.appName, opts.envName)
 		if err != nil {
 			return fmt.Errorf("get environment: %w", err)
@@ -167,9 +167,8 @@ func newResumeSvcOpts(vars resumeSvcVars) (*resumeSvcOpts, error) {
 				return err
 			}
 			a = apprunner.New(sess)
-			d, err = describe.NewAppRunnerServiceDescriber(describe.NewServiceConfig{
+			d, err = describe.NewRDWebServiceDescriber(describe.NewServiceConfig{
 				App:         opts.appName,
-				Env:         opts.envName,
 				Svc:         opts.svcName,
 				ConfigStore: configStore,
 			})

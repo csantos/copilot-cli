@@ -6,6 +6,7 @@ package template
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"text/template"
 
 	"github.com/aws/aws-sdk-go/service/secretsmanager"
@@ -78,6 +79,8 @@ var (
 		"state-machine",
 		"state-machine-definition.json",
 		"efs-access-point",
+		"https-listener",
+		"http-listener",
 		"env-controller",
 		"mount-points",
 		"volumes",
@@ -88,6 +91,7 @@ var (
 		"subscribe",
 		"nlb",
 		"vpc-connector",
+		"alb",
 	}
 
 	// Operating systems to determine Fargate platform versions.
@@ -198,6 +202,7 @@ type LogConfigOpts struct {
 // HTTPHealthCheckOpts holds configuration that's needed for HTTP Health Check.
 type HTTPHealthCheckOpts struct {
 	HealthCheckPath     string
+	Port                string
 	SuccessCodes        string
 	HealthyThreshold    *int64
 	UnhealthyThreshold  *int64
@@ -320,16 +325,30 @@ type CapacityProviderStrategy struct {
 	CapacityProvider string
 }
 
+// Cooldown holds configuration needed for autoscaling cooldown fields.
+type Cooldown struct {
+	ScaleInCooldown  *float64
+	ScaleOutCooldown *float64
+}
+
 // AutoscalingOpts holds configuration that's needed for Auto Scaling.
 type AutoscalingOpts struct {
-	MinCapacity  *int
-	MaxCapacity  *int
-	CPU          *float64
-	Memory       *float64
-	Requests     *float64
-	ResponseTime *float64
-	QueueDelay   *AutoscalingQueueDelayOpts
+	MinCapacity        *int
+	MaxCapacity        *int
+	CPU                *float64
+	Memory             *float64
+	Requests           *float64
+	ResponseTime       *float64
+	CPUCooldown        Cooldown
+	MemCooldown        Cooldown
+	ReqCooldown        Cooldown
+	RespTimeCooldown   Cooldown
+	QueueDelayCooldown Cooldown
+	QueueDelay         *AutoscalingQueueDelayOpts
 }
+
+// AliasesForHostedZone maps hosted zone IDs to aliases that belong to it.
+type AliasesForHostedZone map[string][]string
 
 // AutoscalingQueueDelayOpts holds configuration to scale SQS queues.
 type AutoscalingQueueDelayOpts struct {
@@ -339,6 +358,14 @@ type AutoscalingQueueDelayOpts struct {
 // ObservabilityOpts holds configurations for observability.
 type ObservabilityOpts struct {
 	Tracing string // The name of the vendor used for tracing.
+}
+
+// DeploymentConfiguraitonOpts holds values for MinHealthyPercent and MaxPercent.
+type DeploymentConfigurationOpts struct {
+	// The lower limit on the number of tasks that should be running during a service deployment or when a container instance is draining.
+	MinHealthyPercent int
+	// The upper limit on the number of tasks that should be running during a service deployment or when a container instance is draining.
+	MaxPercent int
 }
 
 // ExecuteCommandOpts holds configuration that's needed for ECS Execute Command.
@@ -385,9 +412,10 @@ func (s *SubscribeOpts) HasTopicQueues() bool {
 
 // TopicSubscription holds information needed to render a SNS Topic Subscription in a container definition.
 type TopicSubscription struct {
-	Name    *string
-	Service *string
-	Queue   *SQSQueue
+	Name         *string
+	Service      *string
+	FilterPolicy *string
+	Queue        *SQSQueue
 }
 
 // SQSQueue holds information needed to render a SQS Queue in a container definition.
@@ -405,9 +433,12 @@ type DeadLetterQueue struct {
 
 // NetworkOpts holds AWS networking configuration for the workloads.
 type NetworkOpts struct {
-	AssignPublicIP string
-	SubnetsType    string
 	SecurityGroups []string
+	AssignPublicIP string
+	// SubnetsType and SubnetIDs are mutually exclusive. They won't be set together.
+	SubnetsType              string
+	SubnetIDs                []string
+	DenyDefaultSecurityGroup bool
 }
 
 // RuntimePlatformOpts holds configuration needed for Platform configuration.
@@ -441,12 +472,25 @@ func (p RuntimePlatformOpts) isEmpty() bool {
 	return p.OS == "" && p.Arch == ""
 }
 
+// S3ObjectLocation represents an object stored in an S3 bucket.
+type S3ObjectLocation struct {
+	Bucket string // Name of the bucket.
+	Key    string // Key of the object.
+}
+
 // WorkloadOpts holds optional data that can be provided to enable features in a workload stack template.
 type WorkloadOpts struct {
+	AppName            string
+	EnvName            string
+	WorkloadName       string
+	SerializedManifest string // Raw manifest file used to deploy the workload.
+
 	// Additional options that are common between **all** workload templates.
 	Variables                map[string]string
 	Secrets                  map[string]Secret
 	Aliases                  []string
+	HTTPSListener            bool
+	UseImportedCerts         bool
 	Tags                     map[string]string        // Used by App Runner workloads to tag App Runner service resources
 	NestedStack              *WorkloadNestedStackOpts // Outputs from nested stacks such as the addons stack.
 	AddonsExtraParams        string                   // Additional user defined Parameters for the addons stack.
@@ -468,23 +512,20 @@ type WorkloadOpts struct {
 	ServiceDiscoveryEndpoint string
 	HTTPVersion              *string
 	ALBEnabled               bool
+	HostedZoneAliases        AliasesForHostedZone
+	CredentialsParameter     string
 
 	// Additional options for service templates.
-	WorkloadType        string
-	HealthCheck         *ContainerHealthCheck
-	HTTPHealthCheck     HTTPHealthCheckOpts
-	DeregistrationDelay *int64
-	AllowedSourceIps    []string
-	NLB                 *NetworkLoadBalancer
+	WorkloadType            string
+	HealthCheck             *ContainerHealthCheck
+	HTTPHealthCheck         HTTPHealthCheckOpts
+	DeregistrationDelay     *int64
+	AllowedSourceIps        []string
+	NLB                     *NetworkLoadBalancer
+	DeploymentConfiguration DeploymentConfigurationOpts
 
-	// Lambda functions.
-	RulePriorityLambda             string
-	DesiredCountLambda             string
-	EnvControllerLambda            string
-	CredentialsParameter           string
-	BacklogPerTaskCalculatorLambda string
-	NLBCertValidatorFunctionLambda string
-	NLBCustomDomainFunctionLambda  string
+	// Custom Resources backed by Lambda functions.
+	CustomResources map[string]S3ObjectLocation
 
 	// Additional options for job templates.
 	ScheduleExpression string
@@ -497,16 +538,12 @@ type WorkloadOpts struct {
 
 	// Input needed for the custom resource that adds a custom domain to the service.
 	Alias                *string
-	ScriptBucketName     *string
-	CustomDomainLambda   *string
 	AWSSDKLayer          *string
 	AppDNSDelegationRole *string
 	AppDNSName           *string
 
 	// Additional options for worker service templates.
 	Subscribe *SubscribeOpts
-
-	FeatureFlags []string
 }
 
 // ParseLoadBalancedWebService parses a load balanced web service's CloudFormation template
@@ -571,19 +608,21 @@ func (t *Template) parseWkld(name, wkldDirName string, data interface{}, options
 func withSvcParsingFuncs() ParseOption {
 	return func(t *template.Template) *template.Template {
 		return t.Funcs(map[string]interface{}{
-			"toSnakeCase":         ToSnakeCaseFunc,
-			"hasSecrets":          hasSecrets,
-			"fmtSlice":            FmtSliceFunc,
-			"quoteSlice":          QuoteSliceFunc,
-			"randomUUID":          randomUUIDFunc,
-			"jsonMountPoints":     generateMountPointJSON,
-			"jsonSNSTopics":       generateSNSJSON,
-			"jsonQueueURIs":       generateQueueURIJSON,
-			"envControllerParams": envControllerParameters,
-			"logicalIDSafe":       StripNonAlphaNumFunc,
-			"wordSeries":          english.WordSeries,
-			"pluralWord":          english.PluralWord,
-			"contains":            contains,
+			"toSnakeCase":          ToSnakeCaseFunc,
+			"hasSecrets":           hasSecrets,
+			"fmtSlice":             FmtSliceFunc,
+			"quoteSlice":           QuoteSliceFunc,
+			"quote":                strconv.Quote,
+			"randomUUID":           randomUUIDFunc,
+			"jsonMountPoints":      generateMountPointJSON,
+			"jsonSNSTopics":        generateSNSJSON,
+			"jsonQueueURIs":        generateQueueURIJSON,
+			"envControllerParams":  envControllerParameters,
+			"logicalIDSafe":        StripNonAlphaNumFunc,
+			"wordSeries":           english.WordSeries,
+			"pluralWord":           english.PluralWord,
+			"contains":             contains,
+			"requiresVPCConnector": requiresVPCConnector,
 		})
 	}
 }
@@ -615,6 +654,11 @@ func envControllerParameters(o WorkloadOpts) []string {
 		}
 		parameters = append(parameters, "Aliases,") // YAML needs the comma separator; resolved in EnvContr.
 	}
+	if o.WorkloadType == "Backend Service" {
+		if o.ALBEnabled {
+			parameters = append(parameters, "InternalALBWorkloads,")
+		}
+	}
 	if o.Network.SubnetsType == PrivateSubnetsPlacement {
 		parameters = append(parameters, "NATWorkloads,")
 	}
@@ -622,6 +666,13 @@ func envControllerParameters(o WorkloadOpts) []string {
 		parameters = append(parameters, "EFSWorkloads,")
 	}
 	return parameters
+}
+
+func requiresVPCConnector(o WorkloadOpts) bool {
+	if o.WorkloadType != "Request-Driven Web Service" {
+		return false
+	}
+	return len(o.Network.SubnetIDs) > 0 || o.Network.SubnetsType != ""
 }
 
 func contains(list []string, s string) bool {

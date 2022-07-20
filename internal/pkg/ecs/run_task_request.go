@@ -5,6 +5,7 @@
 package ecs
 
 import (
+	"encoding/csv"
 	"fmt"
 	"sort"
 	"strings"
@@ -44,6 +45,8 @@ type RunTaskRequest struct {
 
 	executionRole string
 	taskRole      string
+	appName       string
+	envName       string
 	cluster       string
 
 	containerInfo
@@ -96,16 +99,17 @@ func RunTaskRequestFromECSService(client ECSServiceDescriber, cluster, service s
 	}, nil
 }
 
-// RunTaskRequestFromECSService populates a RunTaskRequest with information from a Copilot service.
+// RunTaskRequestFromService populates a RunTaskRequest with information from a Copilot service.
 func RunTaskRequestFromService(client ServiceDescriber, app, env, svc string) (*RunTaskRequest, error) {
 	networkConfig, err := client.NetworkConfiguration(app, env, svc)
 	if err != nil {
 		return nil, fmt.Errorf("retrieve network configuration for service %s: %w", svc, err)
 	}
 
-	cluster, err := client.ClusterARN(app, env)
-	if err != nil {
-		return nil, fmt.Errorf("retrieve cluster ARN created for environment %s in application %s: %w", env, app, err)
+	// --subnets flag isn't supported when passing --app/--env, instead the subnet config
+	// will be read and applied during run.
+	if networkConfig != nil {
+		networkConfig.Subnets = nil
 	}
 
 	taskDef, err := client.TaskDefinition(app, env, svc)
@@ -124,7 +128,8 @@ func RunTaskRequestFromService(client ServiceDescriber, app, env, svc string) (*
 		executionRole:        aws.StringValue(taskDef.ExecutionRoleArn),
 		taskRole:             aws.StringValue(taskDef.TaskRoleArn),
 		containerInfo:        *containerInfo,
-		cluster:              cluster,
+		appName:              app,
+		envName:              env,
 	}, nil
 }
 
@@ -135,9 +140,10 @@ func RunTaskRequestFromJob(client JobDescriber, app, env, job string) (*RunTaskR
 		return nil, fmt.Errorf("retrieve network configuration for job %s: %w", job, err)
 	}
 
-	cluster, err := client.ClusterARN(app, env)
-	if err != nil {
-		return nil, fmt.Errorf("retrieve cluster ARN created for environment %s in application %s: %w", env, app, err)
+	// --subnets flag isn't supported when passing --app/--env, instead the subnet config
+	// will be read and applied during run.
+	if config != nil {
+		config.Subnets = nil
 	}
 
 	taskDef, err := client.TaskDefinition(app, env, job)
@@ -156,12 +162,13 @@ func RunTaskRequestFromJob(client JobDescriber, app, env, job string) (*RunTaskR
 		executionRole:        aws.StringValue(taskDef.ExecutionRoleArn),
 		taskRole:             aws.StringValue(taskDef.TaskRoleArn),
 		containerInfo:        *containerInfo,
-		cluster:              cluster,
+		appName:              app,
+		envName:              env,
 	}, nil
 }
 
 // String stringifies a RunTaskRequest.
-func (r RunTaskRequest) CLIString() string {
+func (r RunTaskRequest) CLIString() (string, error) {
 	output := []string{"copilot task run"}
 	if r.executionRole != "" {
 		output = append(output, fmt.Sprintf("--execution-role %s", r.executionRole))
@@ -184,11 +191,19 @@ func (r RunTaskRequest) CLIString() string {
 	}
 
 	if r.envVars != nil && len(r.envVars) != 0 {
-		output = append(output, fmt.Sprintf("--env-vars %s", fmtStringMapToString(r.envVars)))
+		vars, err := fmtStringMapToString(r.envVars)
+		if err != nil {
+			return "", err
+		}
+		output = append(output, fmt.Sprintf("--env-vars %s", vars))
 	}
 
 	if r.secrets != nil && len(r.secrets) != 0 {
-		output = append(output, fmt.Sprintf("--secrets %s", fmtStringMapToString(r.secrets)))
+		secrets, err := fmtStringMapToString(r.secrets)
+		if err != nil {
+			return "", err
+		}
+		output = append(output, fmt.Sprintf("--secrets %s", secrets))
 	}
 
 	if r.networkConfiguration.Subnets != nil && len(r.networkConfiguration.Subnets) != 0 {
@@ -199,11 +214,19 @@ func (r RunTaskRequest) CLIString() string {
 		output = append(output, fmt.Sprintf("--security-groups %s", strings.Join(r.networkConfiguration.SecurityGroups, ",")))
 	}
 
+	if r.appName != "" {
+		output = append(output, fmt.Sprintf("--app %s", r.appName))
+	}
+
+	if r.envName != "" {
+		output = append(output, fmt.Sprintf("--env %s", r.envName))
+	}
+
 	if r.cluster != "" {
 		output = append(output, fmt.Sprintf("--cluster %s", r.cluster))
 	}
 
-	return strings.Join(output, " \\\n")
+	return strings.Join(output, " \\\n"), nil
 }
 
 func containerInformation(taskDef *awsecs.TaskDefinition, containerName string) (*containerInfo, error) {
@@ -246,18 +269,39 @@ func containerInformation(taskDef *awsecs.TaskDefinition, containerName string) 
 }
 
 // This function will format a map to a string as "key1=value1,key2=value2,key3=value3".
-func fmtStringMapToString(m map[string]string) string {
-	var output []string
-
-	// Sort the map so that `output` is consistent and the unit test won't be flaky.
+// Much of the complexity here comes from the two levels of escaping going on:
+// 1. we are outputting a command to be copied and pasted into a shell, so we need to shell-escape the output.
+// 2. the pflag library parses StringToString args as csv, so we csv escape the individual key/value pairs.
+func fmtStringMapToString(m map[string]string) (string, error) {
+	// Sort the map so that the output is consistent and the unit test won't be flaky.
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
+	// write the key=value pairs as csv fields, which is what
+	// pflag expects to read in.
+	// This will escape internal double quotes and commas.
+	// We then need to trim the trailing newline that the csv writer adds.
+	var output []string
 	for _, k := range keys {
-		output = append(output, fmt.Sprintf("%s=%v", k, m[k]))
+		output = append(output, fmt.Sprintf("%s=%s", k, m[k]))
 	}
-	return strings.Join(output, ",")
+	buf := new(strings.Builder)
+	w := csv.NewWriter(buf)
+	err := w.Write(output)
+	if err != nil {
+		return "", err
+	}
+	w.Flush()
+	final := strings.TrimSuffix(buf.String(), "\n")
+
+	// Then for shell escaping, wrap the entire argument in single quotes
+	// and escape any internal single quotes.
+	return shellQuote(final), nil
+}
+
+func shellQuote(s string) string {
+	return `'` + strings.ReplaceAll(s, `'`, `'\''`) + `'`
 }

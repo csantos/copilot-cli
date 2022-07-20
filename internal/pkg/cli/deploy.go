@@ -61,25 +61,28 @@ func newDeployOpts(vars deployWkldVars) (*deployOpts, error) {
 	return &deployOpts{
 		deployWkldVars: vars,
 		store:          store,
-		sel:            selector.NewWorkspaceSelect(prompter, store, ws),
+		sel:            selector.NewLocalWorkloadSelector(prompter, store, ws),
 		ws:             ws,
 		prompt:         prompter,
 
 		setupDeployCmd: func(o *deployOpts, workloadType string) {
 			switch {
 			case contains(workloadType, manifest.JobTypes()):
-				o.deployWkld = &deployJobOpts{
+				opts := &deployJobOpts{
 					deployWkldVars: o.deployWkldVars,
 
 					store:           o.store,
 					ws:              o.ws,
 					newInterpolator: newManifestInterpolator,
 					unmarshal:       manifest.UnmarshalWorkload,
-					sel:             selector.NewWorkspaceSelect(o.prompt, o.store, o.ws),
+					sel:             selector.NewLocalWorkloadSelector(o.prompt, o.store, ws),
 					cmd:             exec.NewCmd(),
 					sessProvider:    sessProvider,
-					newJobDeployer:  newJobDeployer,
 				}
+				opts.newJobDeployer = func() (workloadDeployer, error) {
+					return newJobDeployer(opts)
+				}
+				o.deployWkld = opts
 			case contains(workloadType, manifest.ServiceTypes()):
 				opts := &deploySvcOpts{
 					deployWkldVars: o.deployWkldVars,
@@ -89,11 +92,13 @@ func newDeployOpts(vars deployWkldVars) (*deployOpts, error) {
 					newInterpolator: newManifestInterpolator,
 					unmarshal:       manifest.UnmarshalWorkload,
 					spinner:         termprogress.NewSpinner(log.DiagnosticWriter),
-					sel:             selector.NewWorkspaceSelect(o.prompt, o.store, o.ws),
+					sel:             selector.NewLocalWorkloadSelector(o.prompt, o.store, ws),
 					prompt:          o.prompt,
 					cmd:             exec.NewCmd(),
 					sessProvider:    sessProvider,
-					newSvcDeployer:  newSvcDeployer,
+				}
+				opts.newSvcDeployer = func() (workloadDeployer, error) {
+					return newSvcDeployer(opts)
 				}
 				o.deployWkld = opts
 			}
@@ -185,6 +190,7 @@ func BuildDeployCmd() *cobra.Command {
 	cmd.Flags().StringVar(&vars.imageTag, imageTagFlag, "", imageTagFlagDescription)
 	cmd.Flags().StringToStringVar(&vars.resourceTags, resourceTagsFlag, nil, resourceTagsFlagDescription)
 	cmd.Flags().BoolVar(&vars.forceNewUpdate, forceFlag, false, forceFlagDescription)
+	cmd.Flags().BoolVar(&vars.disableRollback, noRollbackFlag, false, noRollbackFlagDescription)
 
 	cmd.SetUsageTemplate(template.Usage)
 	cmd.Annotations = map[string]string{

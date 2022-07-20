@@ -8,7 +8,9 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/aws/copilot-cli/internal/pkg/describe"
 
+	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
 	"github.com/aws/copilot-cli/internal/pkg/exec"
 	"github.com/aws/copilot-cli/internal/pkg/term/log"
 
@@ -29,16 +31,15 @@ import (
 type deployJobOpts struct {
 	deployWkldVars
 
-	store           store
-	ws              wsWlDirReader
-	unmarshal       func(in []byte) (manifest.WorkloadManifest, error)
-	newInterpolator func(app, env string) interpolator
-	cmd             runner
-	sessProvider    *sessions.Provider
-	envUpgradeCmd   actionCommand
-	newJobDeployer  func(*deployJobOpts) (workloadDeployer, error)
-
-	sel wsSelector
+	store                store
+	ws                   wsWlDirReader
+	unmarshal            func(in []byte) (manifest.WorkloadManifest, error)
+	newInterpolator      func(app, env string) interpolator
+	cmd                  execRunner
+	sessProvider         *sessions.Provider
+	newJobDeployer       func() (workloadDeployer, error)
+	envFeaturesDescriber versionCompatibilityChecker
+	sel                  wsSelector
 
 	// cached variables
 	targetApp       *config.Application
@@ -60,26 +61,29 @@ func newJobDeployOpts(vars deployWkldVars) (*deployJobOpts, error) {
 		return nil, fmt.Errorf("new workspace: %w", err)
 	}
 	prompter := prompt.New()
-	if err != nil {
-		return nil, err
-	}
-	return &deployJobOpts{
+	opts := &deployJobOpts{
 		deployWkldVars: vars,
 
 		store:           store,
 		ws:              ws,
 		unmarshal:       manifest.UnmarshalWorkload,
-		sel:             selector.NewWorkspaceSelect(prompter, store, ws),
+		sel:             selector.NewLocalWorkloadSelector(prompter, store, ws),
 		sessProvider:    sessProvider,
 		newInterpolator: newManifestInterpolator,
 		cmd:             exec.NewCmd(),
-		newJobDeployer:  newJobDeployer,
-	}, nil
+	}
+	opts.newJobDeployer = func() (workloadDeployer, error) {
+		// NOTE: Defined as a struct member to facilitate unit testing.
+		return newJobDeployer(opts)
+	}
+	return opts, nil
 }
 
 func newJobDeployer(o *deployJobOpts) (workloadDeployer, error) {
-	var err error
-	var deployer workloadDeployer
+	raw, err := o.ws.ReadWorkloadManifest(o.name)
+	if err != nil {
+		return nil, fmt.Errorf("read manifest file for %s: %w", o.name, err)
+	}
 	in := deploy.WorkloadDeployerInput{
 		SessionProvider: o.sessProvider,
 		Name:            o.name,
@@ -87,7 +91,9 @@ func newJobDeployer(o *deployJobOpts) (workloadDeployer, error) {
 		Env:             o.targetEnv,
 		ImageTag:        o.imageTag,
 		Mft:             o.appliedManifest,
+		RawMft:          raw,
 	}
+	var deployer workloadDeployer
 	switch t := o.appliedManifest.(type) {
 	case *manifest.ScheduledJob:
 		deployer, err = deploy.NewJobDeployer(&in)
@@ -136,9 +142,6 @@ func (o *deployJobOpts) Execute() error {
 			return err
 		}
 	}
-	if err := o.envUpgradeCmd.Execute(); err != nil {
-		return fmt.Errorf(`execute "env upgrade --app %s --name %s": %v`, o.appName, o.envName, err)
-	}
 	mft, err := workloadManifest(&workloadManifestInput{
 		name:         o.name,
 		appName:      o.appName,
@@ -151,9 +154,21 @@ func (o *deployJobOpts) Execute() error {
 		return err
 	}
 	o.appliedManifest = mft
-	deployer, err := o.newJobDeployer(o)
+	if err := validateWorkloadManifestCompatibilityWithEnv(o.ws, o.envFeaturesDescriber, mft, o.envName); err != nil {
+		return err
+	}
+	deployer, err := o.newJobDeployer()
 	if err != nil {
 		return err
+	}
+	serviceInRegion, err := deployer.IsServiceAvailableInRegion(o.targetEnv.Region)
+	if err != nil {
+		return fmt.Errorf("check if Scheduled Job(s) is available in region %s: %w", o.targetEnv.Region, err)
+	}
+
+	if !serviceInRegion {
+		log.Warningf(`Scheduled Job might not be available in region %s; proceed with caution.
+`, o.targetEnv.Region)
 	}
 	uploadOut, err := deployer.UploadArtifacts()
 	if err != nil {
@@ -161,14 +176,26 @@ func (o *deployJobOpts) Execute() error {
 	}
 	if _, err = deployer.DeployWorkload(&deploy.DeployWorkloadInput{
 		StackRuntimeConfiguration: deploy.StackRuntimeConfiguration{
-			ImageDigest: uploadOut.ImageDigest,
-			EnvFileARN:  uploadOut.EnvFileARN,
-			AddonsURL:   uploadOut.AddonsURL,
-			RootUserARN: o.rootUserARN,
-			Tags:        tags.Merge(o.targetApp.Tags, o.resourceTags),
+			ImageDigest:        uploadOut.ImageDigest,
+			EnvFileARN:         uploadOut.EnvFileARN,
+			AddonsURL:          uploadOut.AddonsURL,
+			RootUserARN:        o.rootUserARN,
+			Tags:               tags.Merge(o.targetApp.Tags, o.resourceTags),
+			CustomResourceURLs: uploadOut.CustomResourceURLs,
 		},
-		ForceNewUpdate: o.forceNewUpdate,
+		Options: deploy.Options{
+			DisableRollback: o.disableRollback,
+		},
 	}); err != nil {
+		if o.disableRollback {
+			stackName := stack.NameForService(o.targetApp.Name, o.targetEnv.Name, o.name)
+			rollbackCmd := fmt.Sprintf("aws cloudformation rollback-stack --stack-name %s --role-arn %s", stackName, o.targetEnv.ExecutionRoleARN)
+			log.Infof(`It seems like you have disabled automatic stack rollback for this deployment. To debug, you can visit the AWS console to inspect the errors.
+After fixing the deployment, you can:
+1. Run %s to rollback the deployment.
+2. Run %s to make a new deployment.
+`, color.HighlightCode(rollbackCmd), color.HighlightCode("copilot job deploy"))
+		}
 		return fmt.Errorf("deploy job %s to environment %s: %w", o.name, o.envName, err)
 	}
 	log.Successf("Deployed %s.\n", color.HighlightUserInput(o.name))
@@ -194,15 +221,6 @@ func (o *deployJobOpts) configureClients() error {
 		return fmt.Errorf("create default session: %w", err)
 	}
 
-	cmd, err := newEnvUpgradeOpts(envUpgradeVars{
-		appName: o.appName,
-		name:    env.Name,
-	})
-	if err != nil {
-		return fmt.Errorf("new env upgrade command: %v", err)
-	}
-	o.envUpgradeCmd = cmd
-
 	// client to retrieve caller identity.
 	caller, err := identity.New(defaultSess).Get()
 	if err != nil {
@@ -210,6 +228,15 @@ func (o *deployJobOpts) configureClients() error {
 	}
 	o.rootUserARN = caller.RootUserARN
 
+	envDescriber, err := describe.NewEnvDescriber(describe.NewEnvDescriberConfig{
+		App:         o.appName,
+		Env:         o.envName,
+		ConfigStore: o.store,
+	})
+	if err != nil {
+		return err
+	}
+	o.envFeaturesDescriber = envDescriber
 	return nil
 }
 
@@ -289,6 +316,7 @@ func buildJobDeployCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&vars.envName, envFlag, envFlagShort, "", envFlagDescription)
 	cmd.Flags().StringVar(&vars.imageTag, imageTagFlag, "", imageTagFlagDescription)
 	cmd.Flags().StringToStringVar(&vars.resourceTags, resourceTagsFlag, nil, resourceTagsFlagDescription)
+	cmd.Flags().BoolVar(&vars.disableRollback, noRollbackFlag, false, noRollbackFlagDescription)
 
 	return cmd
 }

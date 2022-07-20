@@ -8,24 +8,26 @@ import (
 	"strings"
 
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
-	"github.com/aws/copilot-cli/internal/pkg/template"
 )
 
 // Long flag names.
 const (
 	// Common flags.
-	nameFlag     = "name"
-	appFlag      = "app"
-	envFlag      = "env"
-	workloadFlag = "workload"
-	svcTypeFlag  = "svc-type"
-	jobTypeFlag  = "job-type"
-	typeFlag     = "type"
-	profileFlag  = "profile"
-	yesFlag      = "yes"
-	jsonFlag     = "json"
-	allFlag      = "all"
-	forceFlag    = "force"
+	nameFlag       = "name"
+	appFlag        = "app"
+	envFlag        = "env"
+	workloadFlag   = "workload"
+	svcTypeFlag    = "svc-type"
+	jobTypeFlag    = "job-type"
+	typeFlag       = "type"
+	profileFlag    = "profile"
+	yesFlag        = "yes"
+	jsonFlag       = "json"
+	allFlag        = "all"
+	forceFlag      = "force"
+	noRollbackFlag = "no-rollback"
+	manifestFlag   = "manifest"
+
 	// Command specific flags.
 	dockerFileFlag        = "dockerfile"
 	dockerFileContextFlag = "build-context"
@@ -43,15 +45,18 @@ const (
 	prodEnvFlag           = "prod"
 	deployFlag            = "deploy"
 	resourcesFlag         = "resources"
+
 	githubURLFlag         = "github-url"
 	repoURLFlag           = "url"
 	githubAccessTokenFlag = "github-access-token"
 	gitBranchFlag         = "git-branch"
 	envsFlag              = "environments"
-	domainNameFlag        = "domain"
-	localFlag             = "local"
-	deleteSecretFlag      = "delete-secret"
-	svcPortFlag           = "port"
+	pipelineTypeFlag      = "pipeline-type"
+
+	domainNameFlag   = "domain"
+	localFlag        = "local"
+	deleteSecretFlag = "delete-secret"
+	svcPortFlag      = "port"
 
 	noSubscriptionFlag  = "no-subscribe"
 	subscribeTopicsFlag = "subscribe-topics"
@@ -86,10 +91,12 @@ const (
 	osFlag                       = "platform-os"
 	archFlag                     = "platform-arch"
 
-	vpcIDFlag          = "import-vpc-id"
-	publicSubnetsFlag  = "import-public-subnets"
-	privateSubnetsFlag = "import-private-subnets"
-
+	vpcIDFlag                      = "import-vpc-id"
+	publicSubnetsFlag              = "import-public-subnets"
+	privateSubnetsFlag             = "import-private-subnets"
+	certsFlag                      = "import-cert-arns"
+	internalALBSubnetsFlag         = "internal-alb-subnets"
+	allowVPCIngressFlag            = "internal-alb-allow-vpc-ingress"
 	overrideVPCCIDRFlag            = "override-vpc-cidr"
 	overrideAZsFlag                = "override-az-names"
 	overridePublicSubnetCIDRsFlag  = "override-public-cidrs"
@@ -134,6 +141,7 @@ const (
 	githubAccessTokenFlagShort = "t"
 	gitBranchFlagShort         = "b"
 	envsFlagShort              = "e"
+	pipelineTypeShort          = "p"
 
 	scheduleFlagShort = "s"
 )
@@ -141,38 +149,37 @@ const (
 // Descriptions for flags.
 var (
 	svcTypeFlagDescription = fmt.Sprintf(`Type of service to create. Must be one of:
-%s.`, strings.Join(template.QuoteSliceFunc(manifest.ServiceTypes()), ", "))
+%s.`, strings.Join(quoteStringSlice(manifest.ServiceTypes()), ", "))
 	imageFlagDescription = fmt.Sprintf(`The location of an existing Docker image.
-Mutually exclusive with -%s, --%s.`, dockerFileFlagShort, dockerFileFlag)
+Cannot be specified with --%s or --%s.`, dockerFileFlag, dockerFileContextFlag)
 	dockerFileFlagDescription = fmt.Sprintf(`Path to the Dockerfile.
-Mutually exclusive with -%s, --%s.`, imageFlagShort, imageFlag)
+Cannot be specified with --%s.`, imageFlag)
 	dockerFileContextFlagDescription = fmt.Sprintf(`Path to the Docker build context.
-Mutually exclusive with -%s, --%s.`, imageFlagShort, imageFlag)
+Cannot be specified with --%s.`, imageFlag)
 	storageTypeFlagDescription = fmt.Sprintf(`Type of storage to add. Must be one of:
-%s.`, strings.Join(template.QuoteSliceFunc(storageTypes), ", "))
+%s.`, strings.Join(quoteStringSlice(storageTypes), ", "))
 	jobTypeFlagDescription = fmt.Sprintf(`Type of job to create. Must be one of:
-%s.`, strings.Join(template.QuoteSliceFunc(manifest.JobTypes()), ", "))
+%s.`, strings.Join(quoteStringSlice(manifest.JobTypes()), ", "))
 	wkldTypeFlagDescription = fmt.Sprintf(`Type of job or svc to create. Must be one of:
-%s.`, strings.Join(template.QuoteSliceFunc(manifest.WorkloadTypes()), ", "))
+%s.`, strings.Join(quoteStringSlice(manifest.WorkloadTypes()), ", "))
 
 	clusterFlagDescription = fmt.Sprintf(`Optional. The short name or full ARN of the cluster to run the task in. 
-Cannot be specified with '%s', '%s' or '%s'.`, appFlag, envFlag, taskDefaultFlag)
+Cannot be specified with --%s, --%s or --%s.`, appFlag, envFlag, taskDefaultFlag)
 	acknowledgeSecretsAccessDescription = fmt.Sprintf(`Optional. Skip the confirmation question and grant access to the secrets specified by --secrets flag. 
 This flag is useful only when '%s' flag is specified`, secretsFlag)
 	subnetsFlagDescription = fmt.Sprintf(`Optional. The subnet IDs for the task to use. Can be specified multiple times.
-Cannot be specified with '%s', '%s' or '%s'.`, appFlag, envFlag, taskDefaultFlag)
-	securityGroupsFlagDescription = fmt.Sprintf(`Optional. The security group IDs for the task to use. Can be specified multiple times.
-Cannot be specified with '%s' or '%s'.`, appFlag, envFlag)
+Cannot be specified with --%s, --%s or --%s.`, appFlag, envFlag, taskDefaultFlag)
+	securityGroupsFlagDescription = "Optional. Additional security group IDs for the task to use. Can be specified multiple times."
 	taskRunDefaultFlagDescription = fmt.Sprintf(`Optional. Run tasks in default cluster and default subnets. 
-Cannot be specified with '%s', '%s' or '%s'.`, appFlag, envFlag, subnetsFlag)
+Cannot be specified with --%s, --%s or --%s.`, appFlag, envFlag, subnetsFlag)
 	taskExecDefaultFlagDescription = fmt.Sprintf(`Optional. Execute commands in running tasks in default cluster and default subnets. 
-Cannot be specified with '%s' or '%s'.`, appFlag, envFlag)
+Cannot be specified with --%s or --%s.`, appFlag, envFlag)
 	taskDeleteDefaultFlagDescription = fmt.Sprintf(`Optional. Delete a task which was launched in the default cluster and subnets.
-Cannot be specified with '%s' or '%s'.`, appFlag, envFlag)
+Cannot be specified with --%s or --%s.`, appFlag, envFlag)
 	taskEnvFlagDescription = fmt.Sprintf(`Optional. Name of the environment.
-Cannot be specified with '%s', '%s' or '%s'.`, taskDefaultFlag, subnetsFlag, securityGroupsFlag)
+Cannot be specified with --%s, --%s or --%s.`, taskDefaultFlag, subnetsFlag, securityGroupsFlag)
 	taskAppFlagDescription = fmt.Sprintf(`Optional. Name of the application.
-Cannot be specified with '%s', '%s' or '%s'.`, taskDefaultFlag, subnetsFlag, securityGroupsFlag)
+Cannot be specified with --%s, --%s or --%s.`, taskDefaultFlag, subnetsFlag, securityGroupsFlag)
 	osFlagDescription   = fmt.Sprintf(`Optional. Operating system of the task. Must be specified along with '%s'.`, archFlag)
 	archFlagDescription = fmt.Sprintf(`Optional. Architecture of the task. Must be specified along with '%s'.`, osFlag)
 
@@ -188,18 +195,26 @@ Supported providers are: %s.`, strings.Join(manifest.PipelineProviders, ", "))
 )
 
 const (
-	appFlagDescription      = "Name of the application."
-	envFlagDescription      = "Name of the environment."
-	svcFlagDescription      = "Name of the service."
-	jobFlagDescription      = "Name of the job."
-	workloadFlagDescription = "Name of the service or job."
-	nameFlagDescription     = "Name of the service, job, or task group."
-	pipelineFlagDescription = "Name of the pipeline."
-	profileFlagDescription  = "Name of the profile."
-	yesFlagDescription      = "Skips confirmation prompt."
-	execYesFlagDescription  = "Optional. Whether to update the Session Manager Plugin."
-	jsonFlagDescription     = "Optional. Outputs in JSON format."
-	forceFlagDescription    = "Optional. Force a new service deployment using the existing image."
+	appFlagDescription            = "Name of the application."
+	envFlagDescription            = "Name of the environment."
+	svcFlagDescription            = "Name of the service."
+	jobFlagDescription            = "Name of the job."
+	workloadFlagDescription       = "Name of the service or job."
+	nameFlagDescription           = "Name of the service, job, or task group."
+	pipelineFlagDescription       = "Name of the pipeline."
+	profileFlagDescription        = "Name of the profile."
+	yesFlagDescription            = "Skips confirmation prompt."
+	execYesFlagDescription        = "Optional. Whether to update the Session Manager Plugin."
+	jsonFlagDescription           = "Optional. Output in JSON format."
+	forceFlagDescription          = "Optional. Force a new service deployment using the existing image."
+	forceEnvDeployFlagDescription = "Optional. Force update the environment stack template."
+	noRollbackFlagDescription     = `Optional. Disable automatic stack 
+rollback in case of deployment failure.
+We do not recommend using this flag for a
+production environment.`
+	manifestFlagDescription = "Optional. Output the manifest file used for the deployment."
+	svcManifestFlagDescription = `Optional. Name of the environment in which the service was deployed;
+output the manifest file used for that deployment.`
 
 	imageTagFlagDescription     = `Optional. The container image tag.`
 	resourceTagsFlagDescription = `Optional. Labels with a key and value separated by commas.
@@ -227,12 +242,14 @@ Defaults to all logs. Only one of end-time / follow may be used.`
 	githubAccessTokenFlagDescription = "GitHub personal access token for your repository."
 	gitBranchFlagDescription         = "Branch used to trigger your pipeline."
 	pipelineEnvsFlagDescription      = "Environments to add to the pipeline."
+	pipelineTypeFlagDescription      = `The type of pipeline. Must be either "Workloads" or "Environments".`
 	domainNameFlagDescription        = "Optional. Your existing custom domain name."
 	envResourcesFlagDescription      = "Optional. Show the resources in your environment."
 	svcResourcesFlagDescription      = "Optional. Show the resources in your service."
 	pipelineResourcesFlagDescription = "Optional. Show the resources in your pipeline."
 	localSvcFlagDescription          = "Only show services in the workspace."
 	localJobFlagDescription          = "Only show jobs in the workspace."
+	localPipelineFlagDescription     = "Only show pipelines in the workspace."
 	deleteSecretFlagDescription      = "Deletes AWS Secrets Manager secret associated with a pipeline source repository."
 	svcPortFlagDescription           = "The port on which your service listens."
 
@@ -273,10 +290,14 @@ To use it for an ECS service, specify --generate-cmd <cluster name>/<service nam
 Alternatively, if the service or job is created with Copilot, specify --generate-cmd <application>/<environment>/<service or job name>.
 Cannot be specified with any other flags.`
 
-	vpcIDFlagDescription          = "Optional. Use an existing VPC ID."
-	publicSubnetsFlagDescription  = "Optional. Use existing public subnet IDs."
-	privateSubnetsFlagDescription = "Optional. Use existing private subnet IDs."
-
+	vpcIDFlagDescription              = "Optional. Use an existing VPC ID."
+	publicSubnetsFlagDescription      = "Optional. Use existing public subnet IDs."
+	privateSubnetsFlagDescription     = "Optional. Use existing private subnet IDs."
+	certsFlagDescription              = "Optional. Apply existing ACM certificates to the internet-facing load balancer."
+	internalALBSubnetsFlagDescription = `Optional. Specify subnet IDs for an internal load balancer.
+By default, the load balancer will be placed in your private subnets.
+Cannot be specified with --default-config or any of the --override flags.`
+	allowVPCIngressFlagDescription = `Optional. Allow internal ALB ingress from port 80 and/or port 443.`
 	overrideVPCCIDRFlagDescription = `Optional. Global CIDR to use for VPC.
 (default 10.0.0.0/16)`
 	overrideAZsFlagDescription = `Optional. Availability Zone names.

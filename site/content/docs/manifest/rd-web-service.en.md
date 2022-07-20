@@ -3,39 +3,39 @@ List of all available properties for a `'Request-Driven Web Service'` manifest.
 ???+ note "Sample manifest for a frontend service"
 
     ```yaml
-    # Your service name will be used in naming your resources like log groups, App Runner services, etc.
-    name: frontend
-    type: Request-Driven Web Service
-
-    http:
-      healthcheck:
-        path: '/_healthcheck'
-        healthy_threshold: 3
-        unhealthy_threshold: 5
-        interval: 10s
-        timeout: 5s
-      alias: web.example.com
-
-    # Configuration for your containers and service.
-    image:
-      build: ./frontend/Dockerfile
-      port: 80
-    cpu: 1024
-    memory: 2048
-
-    network:
-      vpc:
-        placement: 'private'
-
-    variables:
-      LOG_LEVEL: info
+        # Your service name will be used in naming your resources like log groups, App Runner services, etc.
+        name: frontend
+        type: Request-Driven Web Service
     
-    tags:
-      owner: frontend-team
-
-    environments:
-      test:
-        LOG_LEVEL: debug
+        http:
+          healthcheck:
+            path: '/_healthcheck'
+            healthy_threshold: 3
+            unhealthy_threshold: 5
+            interval: 10s
+            timeout: 5s
+          alias: web.example.com
+    
+        # Configuration for your containers and service.
+        image:
+          build: ./frontend/Dockerfile
+          port: 80
+        cpu: 1024
+        memory: 2048
+    
+        network:
+          vpc:
+            placement: 'private'
+    
+        variables:
+          LOG_LEVEL: info
+        
+        tags:
+          owner: frontend-team
+    
+        environments:
+          test:
+            LOG_LEVEL: debug
     ```
 
 <a id="name" href="#name" class="field">`name`</a> <span class="type">String</span>  
@@ -154,6 +154,8 @@ When the placement is `'private'`, the App Runner service routes egress traffic 
 If you use a Copilot-generated VPC, Copilot will automatically add NAT Gateways to your environment for internet connectivity. (See [pricing](https://aws.amazon.com/vpc/pricing/).)
 Alternatively, when running `copilot env init`, you can import an existing VPC with NAT Gateways, or one with VPC endpoints 
 for isolated workloads. See our [custom environment resources](../developing/custom-environment-resources.en.md) page for more.
+
+{% include 'observability.en.md' %}
 
 <div class="separator"></div>
 

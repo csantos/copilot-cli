@@ -94,16 +94,15 @@ func newSvcPauseOpts(vars svcPauseVars) (*svcPauseOpts, error) {
 			return err
 		}
 		opts.client = apprunner.New(sess)
-		d, err := describe.NewAppRunnerServiceDescriber(describe.NewServiceConfig{
+		d, err := describe.NewRDWebServiceDescriber(describe.NewServiceConfig{
 			App:         opts.appName,
-			Env:         opts.envName,
 			Svc:         opts.svcName,
 			ConfigStore: opts.store,
 		})
 		if err != nil {
 			return err
 		}
-		opts.svcARN, err = d.ServiceARN()
+		opts.svcARN, err = d.ServiceARN(opts.envName)
 		if err != nil {
 			return fmt.Errorf("retrieve ServiceARN for %s: %w", opts.svcName, err)
 		}
@@ -173,13 +172,13 @@ func (o *svcPauseOpts) validateAndAskSvcEnvName() error {
 		svcPauseSvcNameHelpPrompt,
 		o.appName,
 		selector.WithEnv(o.envName),
-		selector.WithSvc(o.svcName),
+		selector.WithName(o.svcName),
 		selector.WithServiceTypesFilter([]string{manifest.RequestDrivenWebServiceType}),
 	)
 	if err != nil {
 		return fmt.Errorf("select deployed services for application %s: %w", o.appName, err)
 	}
-	o.svcName = deployedService.Svc
+	o.svcName = deployedService.Name
 	o.envName = deployedService.Env
 	return nil
 }

@@ -43,7 +43,7 @@ var (
 	fmtRateScheduleExpression = "rate(%d %s)" // rate({duration} {units})
 	fmtCronScheduleExpression = "cron(%s)"
 
-	awsScheduleRegexp = regexp.MustCompile(`(?:rate|cron)\(.*\)`) // Validates that an expression is of the form rate(xyz) or cron(abc)
+	awsScheduleRegexp = regexp.MustCompile(`((?:rate|cron)\(.*\)|none)`) // Validates that an expression is of the form rate(xyz) or cron(abc) or value 'none'
 )
 
 const (
@@ -89,29 +89,39 @@ func (e errDurationInvalid) Error() string {
 	return fmt.Sprintf("parse duration: %v", e.reason)
 }
 
+// ScheduledJobConfig contains data required to initialize a scheduled job stack.
+type ScheduledJobConfig struct {
+	App           string
+	Env           string
+	Manifest      *manifest.ScheduledJob
+	RawManifest   []byte
+	RuntimeConfig RuntimeConfig
+}
+
 // NewScheduledJob creates a new ScheduledJob stack from a manifest file.
-func NewScheduledJob(mft *manifest.ScheduledJob, env, app string, rc RuntimeConfig) (*ScheduledJob, error) {
+func NewScheduledJob(cfg ScheduledJobConfig) (*ScheduledJob, error) {
 	parser := template.New()
-	addons, err := addon.New(aws.StringValue(mft.Name))
+	addons, err := addon.New(aws.StringValue(cfg.Manifest.Name))
 	if err != nil {
 		return nil, fmt.Errorf("new addons: %w", err)
 	}
 	return &ScheduledJob{
 		ecsWkld: &ecsWkld{
 			wkld: &wkld{
-				name:   aws.StringValue(mft.Name),
-				env:    env,
-				app:    app,
-				rc:     rc,
-				image:  mft.ImageConfig.Image,
-				parser: parser,
-				addons: addons,
+				name:        aws.StringValue(cfg.Manifest.Name),
+				env:         cfg.Env,
+				app:         cfg.App,
+				rc:          cfg.RuntimeConfig,
+				image:       cfg.Manifest.ImageConfig.Image,
+				rawManifest: cfg.RawManifest,
+				parser:      parser,
+				addons:      addons,
 			},
-			logRetention:        mft.Logging.Retention,
-			tc:                  mft.TaskConfig,
+			logRetention:        cfg.Manifest.Logging.Retention,
+			tc:                  cfg.Manifest.TaskConfig,
 			taskDefOverrideFunc: override.CloudFormationTemplate,
 		},
-		manifest: mft,
+		manifest: cfg.Manifest,
 
 		parser: parser,
 	}, nil
@@ -143,9 +153,9 @@ func (j *ScheduledJob) Template() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("convert retry/timeout config for job %s: %w", j.name, err)
 	}
-	envControllerLambda, err := j.parser.Read(envControllerPath)
+	crs, err := convertCustomResources(j.rc.CustomResourcesURL)
 	if err != nil {
-		return "", fmt.Errorf("read env controller lambda: %w", err)
+		return "", err
 	}
 	entrypoint, err := convertEntryPoint(j.manifest.EntryPoint)
 	if err != nil {
@@ -157,8 +167,10 @@ func (j *ScheduledJob) Template() (string, error) {
 	}
 
 	content, err := j.parser.ParseScheduledJob(template.WorkloadOpts{
+		SerializedManifest:       string(j.rawManifest),
 		Variables:                j.manifest.Variables,
 		Secrets:                  convertSecrets(j.manifest.Secrets),
+		WorkloadType:             manifest.ScheduledJobType,
 		NestedStack:              addonsOutputs,
 		AddonsExtraParams:        addonsParams,
 		Sidecars:                 sidecars,
@@ -177,7 +189,7 @@ func (j *ScheduledJob) Template() (string, error) {
 		Publish:                  publishers,
 		Platform:                 convertPlatform(j.manifest.Platform),
 
-		EnvControllerLambda: envControllerLambda.String(),
+		CustomResources: crs,
 	})
 	if err != nil {
 		return "", fmt.Errorf("parse scheduled job template: %w", err)
@@ -211,10 +223,9 @@ func (j *ScheduledJob) Parameters() ([]*cloudformation.Parameter, error) {
 	}...), nil
 }
 
-// SerializedParameters returns the CloudFormation stack's parameters serialized
-// to a YAML document annotated with comments for readability.
+// SerializedParameters returns the CloudFormation stack's parameters serialized to a JSON document.
 func (j *ScheduledJob) SerializedParameters() (string, error) {
-	return j.templateConfiguration(j)
+	return serializeTemplateConfig(j.wkld.parser, j)
 }
 
 // awsSchedule converts the Schedule string to the format required by Cloudwatch Events
@@ -252,6 +263,8 @@ func (j *ScheduledJob) awsSchedule() (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("parse preset schedule: %w", err)
 		}
+	case schedule == "none":
+		scheduleExpression = schedule // Keep expression as "none" when the job is disabled.
 	default:
 		scheduleExpression, err = toAWSCron(schedule)
 		if err != nil {

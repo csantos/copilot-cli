@@ -4,12 +4,11 @@
 package manifest
 
 import (
-	"io/ioutil"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
@@ -56,7 +55,9 @@ func TestNewBackendSvc(t *testing.T) {
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement: &PublicSubnetPlacement,
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
 						},
 					},
 				},
@@ -102,7 +103,9 @@ func TestNewBackendSvc(t *testing.T) {
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement: &PublicSubnetPlacement,
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
 						},
 					},
 				},
@@ -152,7 +155,9 @@ func TestNewBackendSvc(t *testing.T) {
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement: &PublicSubnetPlacement,
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
 						},
 					},
 				},
@@ -175,61 +180,82 @@ func TestNewBackendSvc(t *testing.T) {
 	}
 }
 
-func TestBackendSvc_MarshalBinary(t *testing.T) {
+func TestBackendService_RequiredEnvironmentFeatures(t *testing.T) {
 	testCases := map[string]struct {
-		inProps BackendServiceProps
-
-		wantedTestdata string
+		mft    func(svc *BackendService)
+		wanted []string
 	}{
-		"without healthcheck and port": {
-			inProps: BackendServiceProps{
-				WorkloadProps: WorkloadProps{
-					Name:       "subscribers",
-					Dockerfile: "./subscribers/Dockerfile",
-				},
-				Platform: PlatformArgsOrString{
-					PlatformString: nil,
-					PlatformArgs: PlatformArgs{
-						OSFamily: nil,
-						Arch:     nil,
-					},
-				},
-			},
-			wantedTestdata: "backend-svc-nohealthcheck.yml",
+		"no feature required by default": {
+			mft: func(svc *BackendService) {},
 		},
-		"with custom healthcheck command": {
-			inProps: BackendServiceProps{
-				WorkloadProps: WorkloadProps{
-					Name:  "subscribers",
-					Image: "flask-sample",
-				},
-				HealthCheck: ContainerHealthCheck{
-					Command:     []string{"CMD-SHELL", "curl -f http://localhost:8080 || exit 1"},
-					Interval:    durationp(6 * time.Second),
-					Retries:     aws.Int(0),
-					Timeout:     durationp(20 * time.Second),
-					StartPeriod: durationp(15 * time.Second),
-				},
-				Port: 8080,
+		"internal alb feature required": {
+			mft: func(svc *BackendService) {
+				svc.RoutingRule = RoutingRuleConfiguration{
+					Path: aws.String("/mock_path"),
+				}
 			},
-			wantedTestdata: "backend-svc-customhealthcheck.yml",
+			wanted: []string{template.InternalALBFeatureName},
+		},
+		"nat feature required": {
+			mft: func(svc *BackendService) {
+				svc.Network = NetworkConfig{
+					VPC: vpcConfig{
+						Placement: PlacementArgOrString{
+							PlacementString: placementStringP(PrivateSubnetPlacement),
+						},
+					},
+				}
+			},
+			wanted: []string{template.NATFeatureName},
+		},
+		"efs feature required by enabling managed volume": {
+			mft: func(svc *BackendService) {
+				svc.Storage = Storage{
+					Volumes: map[string]*Volume{
+						"mock-managed-volume-1": {
+							EFS: EFSConfigOrBool{
+								Enabled: aws.Bool(true),
+							},
+						},
+						"mock-imported-volume": {
+							EFS: EFSConfigOrBool{
+								Advanced: EFSVolumeConfiguration{
+									FileSystemID: aws.String("mock-id"),
+								},
+							},
+						},
+					},
+				}
+			},
+			wanted: []string{template.EFSFeatureName},
+		},
+		"efs feature not required because storage is imported": {
+			mft: func(svc *BackendService) {
+				svc.Storage = Storage{
+					Volumes: map[string]*Volume{
+						"mock-imported-volume": {
+							EFS: EFSConfigOrBool{
+								Advanced: EFSVolumeConfiguration{
+									FileSystemID: aws.String("mock-id"),
+								},
+							},
+						},
+					},
+				}
+			},
 		},
 	}
-
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			// GIVEN
-			path := filepath.Join("testdata", tc.wantedTestdata)
-			wantedBytes, err := ioutil.ReadFile(path)
-			require.NoError(t, err)
-			manifest := NewBackendService(tc.inProps)
-
-			// WHEN
-			tpl, err := manifest.MarshalBinary()
-			require.NoError(t, err)
-
-			// THEN
-			require.Equal(t, string(wantedBytes), string(tpl))
+			inSvc := BackendService{
+				Workload: Workload{
+					Name: aws.String("mock-svc"),
+					Type: aws.String(BackendServiceType),
+				},
+			}
+			tc.mft(&inSvc)
+			got := inSvc.RequiredEnvironmentFeatures()
+			require.Equal(t, tc.wanted, got)
 		})
 	}
 }
@@ -312,7 +338,10 @@ func TestBackendService_Publish(t *testing.T) {
 }
 
 func TestBackendSvc_ApplyEnv(t *testing.T) {
-	mockPercentage := Percentage(70)
+	perc := Percentage(70)
+	mockConfig := ScalingConfigOrT[Percentage]{
+		Value: &perc,
+	}
 	mockBackendServiceWithNoEnvironments := BackendService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
@@ -424,7 +453,7 @@ func TestBackendSvc_ApplyEnv(t *testing.T) {
 				TaskConfig: TaskConfig{
 					Count: Count{
 						AdvancedCount: AdvancedCount{
-							CPU: &mockPercentage,
+							CPU: mockConfig,
 						},
 					},
 					CPU: aws.Int(512),
@@ -620,7 +649,7 @@ func TestBackendSvc_ApplyEnv(t *testing.T) {
 						Memory: aws.Int(256),
 						Count: Count{
 							AdvancedCount: AdvancedCount{
-								CPU: &mockPercentage,
+								CPU: mockConfig,
 							},
 						},
 						Variables: map[string]string{
@@ -747,7 +776,10 @@ func TestBackendSvc_ApplyEnv(t *testing.T) {
 
 func TestBackendSvc_ApplyEnv_CountOverrides(t *testing.T) {
 	mockRange := IntRangeBand("1-10")
-	mockPercentage := Percentage(80)
+	perc := Percentage(80)
+	mockConfig := ScalingConfigOrT[Percentage]{
+		Value: &perc,
+	}
 	testCases := map[string]struct {
 		svcCount Count
 		envCount Count
@@ -758,7 +790,7 @@ func TestBackendSvc_ApplyEnv_CountOverrides(t *testing.T) {
 			svcCount: Count{
 				AdvancedCount: AdvancedCount{
 					Range: Range{Value: &mockRange},
-					CPU:   &mockPercentage,
+					CPU:   mockConfig,
 				},
 			},
 			envCount: Count{},
@@ -768,7 +800,7 @@ func TestBackendSvc_ApplyEnv_CountOverrides(t *testing.T) {
 						Count: Count{
 							AdvancedCount: AdvancedCount{
 								Range: Range{Value: &mockRange},
-								CPU:   &mockPercentage,
+								CPU:   mockConfig,
 							},
 						},
 					},

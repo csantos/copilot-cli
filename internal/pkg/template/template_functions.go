@@ -6,10 +6,14 @@ package template
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/aws/aws-sdk-go/aws/arn"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+
+	"github.com/aws/aws-sdk-go/aws/arn"
 
 	"github.com/aws/aws-sdk-go/aws"
 )
@@ -166,7 +170,7 @@ func generateQueueURIJSON(ts []*TopicSubscription) string {
 		}
 		svc := StripNonAlphaNumFunc(aws.StringValue(sub.Service))
 		topicName := StripNonAlphaNumFunc(aws.StringValue(sub.Name))
-		subName := fmt.Sprintf("%s%sEventsQueue", svc, strings.Title(topicName))
+		subName := fmt.Sprintf("%s%sEventsQueue", svc, cases.Title(language.English).String(topicName))
 
 		urlMap[subName] = fmt.Sprintf("${%s%sURL}", svc, topicName)
 	}

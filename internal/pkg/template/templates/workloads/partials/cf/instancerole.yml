@@ -12,6 +12,7 @@ InstanceRole:
     {{- end}}
   {{- end}}
     AssumeRolePolicyDocument:
+      Version: '2012-10-17'
       Statement:
         - Effect: Allow
           Principal:
@@ -47,7 +48,7 @@ InstanceRole:
               {{- end }}
       {{- end }}
       {{- end }}
-      {{- if and (contains .FeatureFlags "Tracing") (eq .Observability.Tracing "AWSXRAY")}}
+      {{- if eq .Observability.Tracing "AWSXRAY"}}
       - PolicyName: 'EnableAWSXRayTracing'
         PolicyDocument:
           Version: '2012-10-17'

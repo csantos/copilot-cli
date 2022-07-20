@@ -86,7 +86,7 @@ func newDeleteSvcOpts(vars deleteSvcVars) (*deleteSvcOpts, error) {
 		spinner: termprogress.NewSpinner(log.DiagnosticWriter),
 		prompt:  prompter,
 		sess:    sessProvider,
-		sel:     selector.NewConfigSelect(prompter, store),
+		sel:     selector.NewConfigSelector(prompter, store),
 		appCFN:  cloudformation.New(defaultSession),
 		getSvcCFN: func(session *awssession.Session) wlDeleter {
 			return cloudformation.New(session)
@@ -328,7 +328,7 @@ func (o *deleteSvcOpts) deleteSSMParam() error {
 func (o *deleteSvcOpts) RecommendActions() error {
 	logRecommendedActions([]string{
 		fmt.Sprintf("Run %s to update the corresponding pipeline if it exists.",
-			color.HighlightCode("copilot pipeline update")),
+			color.HighlightCode("copilot pipeline deploy")),
 	})
 	return nil
 }

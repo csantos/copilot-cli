@@ -59,8 +59,8 @@ func TestResumeSvcOpts_Ask(t *testing.T) {
 				)
 				m.sel.EXPECT().DeployedService(fmt.Sprintf(svcResumeSvcNamePrompt, testAppName), svcResumeSvcNameHelpPrompt, "phonetool", gomock.Any(), gomock.Any(), gomock.Any()).
 					Return(&selector.DeployedService{
-						Env: "test",
-						Svc: "api",
+						Env:  "test",
+						Name: "api",
 					}, nil) // Let prompter handles the case when svc(env) is definite.
 			},
 			wantedApp: testAppName,
@@ -78,8 +78,8 @@ func TestResumeSvcOpts_Ask(t *testing.T) {
 				m.store.EXPECT().GetService(gomock.Any(), gomock.Any()).AnyTimes()
 				m.sel.EXPECT().DeployedService(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 					Return(&selector.DeployedService{
-						Env: testEnvName,
-						Svc: testSvcName,
+						Env:  testEnvName,
+						Name: testSvcName,
 					}, nil).AnyTimes()
 			},
 			wantedApp: testAppName,
@@ -105,8 +105,8 @@ func TestResumeSvcOpts_Ask(t *testing.T) {
 				m.sel.EXPECT().DeployedService("Which service of phonetool would you like to resume?",
 					svcResumeSvcNameHelpPrompt, testAppName, gomock.Any(), gomock.Any(), gomock.Any()).
 					Return(&selector.DeployedService{
-						Env: testEnvName,
-						Svc: testSvcName,
+						Env:  testEnvName,
+						Name: testSvcName,
 					}, nil)
 			},
 			wantedApp: testAppName,
@@ -196,7 +196,7 @@ func TestResumeSvcOpts_Execute(t *testing.T) {
 			envName: testEnvName,
 			svcName: testSvcName,
 			setupMocks: func(m *resumeSvcMocks) {
-				m.apprunnerDescriber.EXPECT().ServiceARN().Return(testSvcARN, nil)
+				m.apprunnerDescriber.EXPECT().ServiceARN(testEnvName).Return(testSvcARN, nil)
 				gomock.InOrder(
 					m.spinner.EXPECT().Start("Resuming service phonetool in environment test."),
 					m.serviceResumer.EXPECT().ResumeService(testSvcARN).Return(nil),
@@ -210,7 +210,7 @@ func TestResumeSvcOpts_Execute(t *testing.T) {
 			envName: testEnvName,
 			svcName: testSvcName,
 			setupMocks: func(m *resumeSvcMocks) {
-				m.apprunnerDescriber.EXPECT().ServiceARN().Return("", mockError)
+				m.apprunnerDescriber.EXPECT().ServiceARN(testEnvName).Return("", mockError)
 			},
 			wantedError: mockError,
 		},
@@ -219,7 +219,7 @@ func TestResumeSvcOpts_Execute(t *testing.T) {
 			envName: testEnvName,
 			svcName: testSvcName,
 			setupMocks: func(m *resumeSvcMocks) {
-				m.apprunnerDescriber.EXPECT().ServiceARN().Return(testSvcARN, nil)
+				m.apprunnerDescriber.EXPECT().ServiceARN(testEnvName).Return(testSvcARN, nil)
 				gomock.InOrder(
 					m.spinner.EXPECT().Start("Resuming service phonetool in environment test."),
 					m.serviceResumer.EXPECT().ResumeService(testSvcARN).Return(mockError),

@@ -5,6 +5,7 @@ package task
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/aws/copilot-cli/internal/pkg/aws/ec2"
 	"github.com/aws/copilot-cli/internal/pkg/aws/ecs"
@@ -14,6 +15,7 @@ import (
 const (
 	fmtErrSecurityGroupsFromEnv = "get security groups from environment %s: %w"
 	fmtErrDescribeEnvironment   = "describe environment %s: %w"
+	fmtErrNumSecurityGroups     = "unable to run task with more than 5 security groups: (%d) %s"
 
 	envSecurityGroupCFNLogicalIDTagKey   = "aws:cloudformation:logical-id"
 	envSecurityGroupCFNLogicalIDTagValue = "EnvironmentSecurityGroup"
@@ -36,7 +38,10 @@ type EnvRunner struct {
 	App string
 	Env string
 
-	// Platform configuration
+	// Extra security groups to use.
+	SecurityGroups []string
+
+	// Platform configuration.
 	OS string
 
 	// Interfaces to interact with dependencies. Must not be nil.
@@ -44,6 +49,9 @@ type EnvRunner struct {
 	ClusterGetter        ClusterGetter
 	Starter              Runner
 	EnvironmentDescriber EnvironmentDescriber
+
+	// Figures non-zero exit code of the task
+	NonZeroExitCodeGetter NonZeroExitCodeGetter
 }
 
 // Run runs tasks in the environment of the application, and returns the tasks.
@@ -76,12 +84,14 @@ func (r *EnvRunner) Run() ([]*Task, error) {
 	if err != nil {
 		return nil, fmt.Errorf(fmtErrSecurityGroupsFromEnv, r.Env, err)
 	}
+	securityGroups = appendUniqueStrings(securityGroups, r.SecurityGroups...)
+	if numSGs := len(securityGroups); numSGs > 5 {
+		return nil, fmt.Errorf(fmtErrNumSecurityGroups, numSGs, strings.Join(securityGroups, ","))
+	}
 
 	platformVersion := "LATEST"
-	enableExec := true
 	if IsValidWindowsOS(r.OS) {
 		platformVersion = "1.0.0"
-		enableExec = false
 	}
 
 	ecsTasks, err := r.Starter.RunTask(ecs.RunTaskInput{
@@ -92,7 +102,7 @@ func (r *EnvRunner) Run() ([]*Task, error) {
 		TaskFamilyName:  taskFamilyName(r.GroupName),
 		StartedBy:       startedBy,
 		PlatformVersion: platformVersion,
-		EnableExec:      enableExec,
+		EnableExec:      true,
 	})
 	if err != nil {
 		return nil, &errRunTask{
@@ -130,4 +140,35 @@ func (r *EnvRunner) validateDependencies() error {
 	}
 
 	return nil
+}
+
+func appendUniqueStrings(s1 []string, s2 ...string) []string {
+	for _, v := range s2 {
+		if !containsString(s1, v) {
+			s1 = append(s1, v)
+		}
+	}
+	return s1
+}
+
+func containsString(s []string, search string) bool {
+	for _, v := range s {
+		if v == search {
+			return true
+		}
+	}
+	return false
+}
+
+// CheckNonZeroExitCode returns the status of the containers part of the given tasks.
+func (r *EnvRunner) CheckNonZeroExitCode(tasks []*Task) error {
+	cluster, err := r.ClusterGetter.ClusterARN(r.App, r.Env)
+	if err != nil {
+		return fmt.Errorf("get cluster for environment %s: %w", r.Env, err)
+	}
+	taskARNs := make([]string, len(tasks))
+	for idx, task := range tasks {
+		taskARNs[idx] = task.TaskARN
+	}
+	return r.NonZeroExitCodeGetter.HasNonZeroExitCode(taskARNs, cluster)
 }

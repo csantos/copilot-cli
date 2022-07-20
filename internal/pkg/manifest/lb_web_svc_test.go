@@ -5,12 +5,11 @@ package manifest
 
 import (
 	"fmt"
-	"io/ioutil"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
@@ -72,7 +71,9 @@ func TestNewHTTPLoadBalancedWebService(t *testing.T) {
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement: &PublicSubnetPlacement,
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
 						},
 					},
 				},
@@ -146,7 +147,9 @@ func TestNewHTTPLoadBalancedWebService(t *testing.T) {
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement: &PublicSubnetPlacement,
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
 						},
 					},
 				},
@@ -225,51 +228,15 @@ func TestNewLoadBalancedWebService_UnmarshalYaml(t *testing.T) {
 	}
 }
 
-func TestLoadBalancedWebService_MarshalBinary(t *testing.T) {
-	testCases := map[string]struct {
-		inProps LoadBalancedWebServiceProps
-
-		wantedTestdata string
-	}{
-		"default": {
-			inProps: LoadBalancedWebServiceProps{
-				WorkloadProps: &WorkloadProps{
-					Name:       "frontend",
-					Dockerfile: "./frontend/Dockerfile",
-				},
-				Platform: PlatformArgsOrString{
-					PlatformString: nil,
-					PlatformArgs:   PlatformArgs{},
-				},
-			},
-			wantedTestdata: "lb-svc.yml",
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			// GIVEN
-			path := filepath.Join("testdata", tc.wantedTestdata)
-			wantedBytes, err := ioutil.ReadFile(path)
-			require.NoError(t, err)
-			manifest := NewLoadBalancedWebService(&tc.inProps)
-
-			// WHEN
-			tpl, err := manifest.MarshalBinary()
-			require.NoError(t, err)
-
-			// THEN
-			require.Equal(t, string(wantedBytes), string(tpl))
-		})
-	}
-}
-
 func TestLoadBalancedWebService_ApplyEnv(t *testing.T) {
 	var (
+		perc       = Percentage(80)
 		mockIPNet1 = IPNet("10.1.0.0/24")
 		mockIPNet2 = IPNet("10.1.1.0/24")
 		mockRange  = IntRangeBand("1-10")
-		mockPerc   = Percentage(80)
+		mockConfig = ScalingConfigOrT[Percentage]{
+			Value: &perc,
+		}
 	)
 	testCases := map[string]struct {
 		in         *LoadBalancedWebService
@@ -454,8 +421,12 @@ func TestLoadBalancedWebService_ApplyEnv(t *testing.T) {
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement:      &PublicSubnetPlacement,
-							SecurityGroups: []string{"sg-123"},
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
+							SecurityGroups: SecurityGroupsIDsOrConfig{
+								IDs: []string{"sg-123"},
+							},
 						},
 					},
 				},
@@ -522,7 +493,9 @@ func TestLoadBalancedWebService_ApplyEnv(t *testing.T) {
 						},
 						Network: NetworkConfig{
 							VPC: vpcConfig{
-								SecurityGroups: []string{"sg-456", "sg-789"},
+								SecurityGroups: SecurityGroupsIDsOrConfig{
+									IDs: []string{"sg-456", "sg-789"},
+								},
 							},
 						},
 					},
@@ -615,8 +588,12 @@ func TestLoadBalancedWebService_ApplyEnv(t *testing.T) {
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement:      &PublicSubnetPlacement,
-							SecurityGroups: []string{"sg-456", "sg-789"},
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
+							SecurityGroups: SecurityGroupsIDsOrConfig{
+								IDs: []string{"sg-456", "sg-789"},
+							},
 						},
 					},
 				},
@@ -629,7 +606,7 @@ func TestLoadBalancedWebService_ApplyEnv(t *testing.T) {
 						Count: Count{
 							AdvancedCount: AdvancedCount{
 								Range: Range{Value: &mockRange},
-								CPU:   &mockPerc,
+								CPU:   mockConfig,
 							},
 						},
 					},
@@ -655,7 +632,7 @@ func TestLoadBalancedWebService_ApplyEnv(t *testing.T) {
 							Value: nil,
 							AdvancedCount: AdvancedCount{
 								Range: Range{Value: &mockRange},
-								CPU:   &mockPerc,
+								CPU:   mockConfig,
 							},
 						},
 					},
@@ -680,14 +657,18 @@ func TestLoadBalancedWebService_ApplyEnv(t *testing.T) {
 						Count: Count{
 							AdvancedCount: AdvancedCount{
 								Range: Range{Value: &mockRange},
-								CPU:   &mockPerc,
+								CPU:   mockConfig,
 							},
 						},
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement:      &PublicSubnetPlacement,
-							SecurityGroups: []string{"sg-456", "sg-789"},
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
+							SecurityGroups: SecurityGroupsIDsOrConfig{
+								IDs: []string{"sg-456", "sg-789"},
+							},
 						},
 					},
 				},
@@ -704,14 +685,69 @@ func TestLoadBalancedWebService_ApplyEnv(t *testing.T) {
 							Value: nil,
 							AdvancedCount: AdvancedCount{
 								Range: Range{Value: &mockRange},
-								CPU:   &mockPerc,
+								CPU:   mockConfig,
 							},
 						},
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement:      &PublicSubnetPlacement,
-							SecurityGroups: []string{"sg-456", "sg-789"},
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
+							SecurityGroups: SecurityGroupsIDsOrConfig{
+								IDs: []string{"sg-456", "sg-789"},
+							},
+						},
+					},
+				},
+			},
+		},
+		"with network config overridden by security group config": {
+			in: &LoadBalancedWebService{
+				LoadBalancedWebServiceConfig: LoadBalancedWebServiceConfig{
+					Network: NetworkConfig{
+						VPC: vpcConfig{
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
+							SecurityGroups: SecurityGroupsIDsOrConfig{
+								AdvancedConfig: SecurityGroupsConfig{
+									SecurityGroups: []string{"sg-535", "sg-789"},
+								},
+							},
+						},
+					},
+				},
+				Environments: map[string]*LoadBalancedWebServiceConfig{
+					"prod-iad": {
+						Network: NetworkConfig{
+							VPC: vpcConfig{
+								SecurityGroups: SecurityGroupsIDsOrConfig{
+									AdvancedConfig: SecurityGroupsConfig{
+										SecurityGroups: []string{"sg-456", "sg-700"},
+										DenyDefault:    aws.Bool(true),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			envToApply: "prod-iad",
+
+			wanted: &LoadBalancedWebService{
+				LoadBalancedWebServiceConfig: LoadBalancedWebServiceConfig{
+					Network: NetworkConfig{
+						VPC: vpcConfig{
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
+							SecurityGroups: SecurityGroupsIDsOrConfig{
+								AdvancedConfig: SecurityGroupsConfig{
+									SecurityGroups: []string{"sg-456", "sg-700"},
+									DenyDefault:    aws.Bool(true),
+								},
+							},
 						},
 					},
 				},
@@ -1400,138 +1436,6 @@ func TestLoadBalancedWebService_BuildRequired(t *testing.T) {
 	}
 }
 
-func TestLoadBalancedWebService_HasAliases(t *testing.T) {
-	testCases := map[string]struct {
-		config LoadBalancedWebServiceConfig
-		want   bool
-	}{
-		"use http aliases": {
-			config: LoadBalancedWebServiceConfig{
-				RoutingRule: RoutingRuleConfigOrBool{
-					RoutingRuleConfiguration: RoutingRuleConfiguration{
-						Alias: Alias{
-							String: aws.String("mockAlias"),
-						},
-					},
-				},
-			},
-			want: true,
-		},
-		"use nlb aliases": {
-			config: LoadBalancedWebServiceConfig{
-				NLBConfig: NetworkLoadBalancerConfiguration{
-					Aliases: Alias{
-						StringSlice: []string{"mockAlias", "mockAnotherAlias"},
-					},
-				},
-			},
-			want: true,
-		},
-		"both http and nlb use aliases": {
-			config: LoadBalancedWebServiceConfig{
-				RoutingRule: RoutingRuleConfigOrBool{
-					RoutingRuleConfiguration: RoutingRuleConfiguration{
-						Alias: Alias{
-							StringSlice: []string{"mockAlias", "mockAnotherAlias"},
-						},
-					},
-				},
-				NLBConfig: NetworkLoadBalancerConfiguration{
-					Aliases: Alias{
-						String: aws.String("mockAlias"),
-					},
-				},
-			},
-			want: true,
-		},
-		"not using aliases": {
-			config: LoadBalancedWebServiceConfig{},
-			want:   false,
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			// GIVEN
-			manifest := &LoadBalancedWebService{
-				LoadBalancedWebServiceConfig: tc.config,
-			}
-
-			// WHEN
-			got := manifest.HasAliases()
-
-			// THEN
-			require.Equal(t, tc.want, got)
-		})
-	}
-}
-
-func TestAlias_IsEmpty(t *testing.T) {
-	testCases := map[string]struct {
-		in     Alias
-		wanted bool
-	}{
-		"empty alias": {
-			in:     Alias{},
-			wanted: true,
-		},
-		"non empty alias": {
-			in: Alias{
-				String: aws.String("alias test"),
-			},
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			// WHEN
-			got := tc.in.IsEmpty()
-
-			// THEN
-			require.Equal(t, tc.wanted, got)
-		})
-	}
-}
-
-func TestRoutingRuleConfigOrBool_Disabled(t *testing.T) {
-	testCases := map[string]struct {
-		in     RoutingRuleConfigOrBool
-		wanted bool
-	}{
-		"disabled": {
-			in: RoutingRuleConfigOrBool{
-				Enabled: aws.Bool(false),
-			},
-			wanted: true,
-		},
-		"enabled implicitly": {
-			in: RoutingRuleConfigOrBool{},
-		},
-		"enabled explicitly": {
-			in: RoutingRuleConfigOrBool{
-				Enabled: aws.Bool(true),
-			},
-		},
-		"enabled explicitly by advanced configuration": {
-			in: RoutingRuleConfigOrBool{
-				RoutingRuleConfiguration: RoutingRuleConfiguration{
-					Path: aws.String("mockPath"),
-				},
-			},
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			// WHEN
-			got := tc.in.Disabled()
-
-			// THEN
-			require.Equal(t, tc.wanted, got)
-		})
-	}
-}
-
 func TestNetworkLoadBalancerConfiguration_IsEmpty(t *testing.T) {
 	testCases := map[string]struct {
 		in     NetworkLoadBalancerConfiguration
@@ -1559,30 +1463,105 @@ func TestNetworkLoadBalancerConfiguration_IsEmpty(t *testing.T) {
 	}
 }
 
-func TestAlias_ToString(t *testing.T) {
+func TestLoadBalancedWebService_RequiredEnvironmentFeatures(t *testing.T) {
 	testCases := map[string]struct {
-		inAlias Alias
-		wanted  string
+		mft    func(svc *LoadBalancedWebService)
+		wanted []string
 	}{
-		"alias using string": {
-			inAlias: Alias{
-				String: stringP("example.com"),
+		"no feature required": {
+			mft: func(svc *LoadBalancedWebService) {
+				svc.RoutingRule = RoutingRuleConfigOrBool{
+					Enabled: aws.Bool(false),
+				}
 			},
-			wanted: "example.com",
 		},
-		"alias using string slice": {
-			inAlias: Alias{
-				StringSlice: []string{"example.com", "v1.example.com"},
+		"alb feature required by default": {
+			mft:    func(svc *LoadBalancedWebService) {},
+			wanted: []string{template.ALBFeatureName},
+		},
+		"nat feature required": {
+			mft: func(svc *LoadBalancedWebService) {
+				svc.Network = NetworkConfig{
+					VPC: vpcConfig{
+						Placement: PlacementArgOrString{
+							PlacementString: placementStringP(PrivateSubnetPlacement),
+						},
+					},
+				}
 			},
-			wanted: "example.com,v1.example.com",
+			wanted: []string{template.ALBFeatureName, template.NATFeatureName},
+		},
+		"efs feature required by enabling managed volume with bool": {
+			mft: func(svc *LoadBalancedWebService) {
+				svc.Storage = Storage{
+					Volumes: map[string]*Volume{
+						"mock-managed-volume-1": {
+							EFS: EFSConfigOrBool{
+								Enabled: aws.Bool(true),
+							},
+						},
+						"mock-imported-volume": {
+							EFS: EFSConfigOrBool{
+								Advanced: EFSVolumeConfiguration{
+									FileSystemID: aws.String("mock-id"),
+								},
+							},
+						},
+					},
+				}
+			},
+			wanted: []string{template.ALBFeatureName, template.EFSFeatureName},
+		},
+		"efs feature required by enabling managed volume with uid or gid": {
+			mft: func(svc *LoadBalancedWebService) {
+				svc.Storage = Storage{
+					Volumes: map[string]*Volume{
+						"mock-managed-volume-1": {
+							EFS: EFSConfigOrBool{
+								Advanced: EFSVolumeConfiguration{
+									UID: aws.Uint32(1),
+								},
+							},
+						},
+						"mock-imported-volume": {
+							EFS: EFSConfigOrBool{
+								Advanced: EFSVolumeConfiguration{
+									FileSystemID: aws.String("mock-id"),
+								},
+							},
+						},
+					},
+				}
+			},
+			wanted: []string{template.ALBFeatureName, template.EFSFeatureName},
+		},
+		"efs feature not required because storage is imported": {
+			mft: func(svc *LoadBalancedWebService) {
+				svc.Storage = Storage{
+					Volumes: map[string]*Volume{
+						"mock-imported-volume": {
+							EFS: EFSConfigOrBool{
+								Advanced: EFSVolumeConfiguration{
+									FileSystemID: aws.String("mock-id"),
+								},
+							},
+						},
+					},
+				}
+			},
+			wanted: []string{template.ALBFeatureName},
 		},
 	}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			// WHEN
-			got := tc.inAlias.ToString()
-
-			// THEN
+			inSvc := LoadBalancedWebService{
+				Workload: Workload{
+					Name: aws.String("mock-svc"),
+					Type: aws.String(LoadBalancedWebServiceType),
+				},
+			}
+			tc.mft(&inSvc)
+			got := inSvc.RequiredEnvironmentFeatures()
 			require.Equal(t, tc.wanted, got)
 		})
 	}

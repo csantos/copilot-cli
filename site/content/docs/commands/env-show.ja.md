@@ -1,5 +1,5 @@
 # env show
-```bash
+```console
 $ copilot env show [flags]
 ```
 
@@ -14,9 +14,10 @@ $ copilot env show [flags]
 オプションで `--resources` フラグを付けると Environment に関連する AWS リソースが表示されます。
 
 ## フラグ
-```bash
+```
+-a, --app string    Name of the application.
 -h, --help          help for show
-    --json          Optional. Outputs in JSON format.
+    --json          Optional. Output in JSON format.
 -n, --name string   Name of the environment.
     --resources     Optional. Show the resources in your environment.
 ```
@@ -24,6 +25,6 @@ $ copilot env show [flags]
 
 ## 実行例
 "test" Environment に関する情報を表示します。
-```bash
+```console
 $ copilot env show -n test
 ```

@@ -58,8 +58,8 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       Code:
-        ZipFile: |
-          Abracadabra
+        S3Bucket:
+        S3Key:
       Handler: "index.handler"
       Timeout: 900
       MemorySize: 512
@@ -67,10 +67,12 @@ Resources:
       Runtime: nodejs12.x
 
   EnvControllerRole:
+    Metadata:
+      'aws:copilot:description': "An IAM role to update your environment stack"
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
           -
             Effect: Allow
@@ -211,6 +213,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -276,6 +279,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -332,6 +336,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
         - Effect: Allow
           Principal:
@@ -340,6 +345,7 @@ Resources:
       Policies:
       - PolicyName: EventRulePolicy
         PolicyDocument:
+          Version: '2012-10-17'
           Statement:
           - Effect: Allow
             Action: states:StartExecution
@@ -417,10 +423,12 @@ Resources:
         }      
         
   StateMachineRole:
+    Metadata:
+      'aws:copilot:description': 'An IAM role for a state machine to run ECS tasks in your cluster'
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
         - Effect: Allow
           Principal:
@@ -429,6 +437,7 @@ Resources:
       Policies:
       - PolicyName: StateMachine
         PolicyDocument:
+          Version: '2012-10-17'
           Statement:
           - Effect: Allow
             Action: iam:PassRole

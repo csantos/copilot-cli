@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/stretchr/testify/require"
@@ -20,10 +21,11 @@ const (
 	autoScalingManifestPath = "manifest.yml"
 
 	appName  = "my-app"
-	envName  = "test"
 	imageURL = "mockImageURL"
 	imageTag = "latest"
 )
+
+var envName = "test"
 
 func Test_Stack_Local_Integration(t *testing.T) {
 	const (
@@ -39,12 +41,23 @@ func Test_Stack_Local_Integration(t *testing.T) {
 	v, ok := mft.(*manifest.LoadBalancedWebService)
 	require.Equal(t, ok, true)
 
-	serializer, err := stack.NewLoadBalancedWebService(v, envName, appName, stack.RuntimeConfig{
-		Image: &stack.ECRImage{
-			RepoURL:  imageURL,
-			ImageTag: imageTag,
+	envConfig := &manifest.Environment{
+		Workload: manifest.Workload{
+			Name: &envName,
 		},
-	}, stack.WithHTTPS())
+	}
+	envConfig.HTTPConfig.Public.Certificates = []string{"mockCertARN"}
+	serializer, err := stack.NewLoadBalancedWebService(stack.LoadBalancedWebServiceConfig{
+		App:         &config.Application{Name: appName},
+		EnvManifest: envConfig,
+		Manifest:    v,
+		RuntimeConfig: stack.RuntimeConfig{
+			Image: &stack.ECRImage{
+				RepoURL:  imageURL,
+				ImageTag: imageTag,
+			},
+		},
+	})
 	require.NoError(t, err)
 	tpl, err := serializer.Template()
 	require.NoError(t, err)

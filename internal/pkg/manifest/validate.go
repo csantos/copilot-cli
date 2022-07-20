@@ -53,6 +53,7 @@ var (
 	dependsOnValidStatuses                   = []string{dependsOnStart, dependsOnComplete, dependsOnSuccess, dependsOnHealthy}
 	nlbValidProtocols                        = []string{TCP, tls}
 	TracingValidVendors                      = []string{awsXRAY}
+	ecsRollingUpdateStrategies               = []string{ECSDefaultRollingUpdateStrategy, ECSRecreateRollingUpdateStrategy}
 
 	httpProtocolVersions = []string{"GRPC", "HTTP1", "HTTP2"}
 
@@ -70,7 +71,7 @@ func (l LoadBalancedWebService) Validate() error {
 	}
 	if err = validateTargetContainer(validateTargetContainerOpts{
 		mainContainerName: aws.StringValue(l.Name),
-		targetContainer:   l.RoutingRule.targetContainer(),
+		targetContainer:   l.RoutingRule.GetTargetContainer(),
 		sidecarConfig:     l.Sidecars,
 	}); err != nil {
 		return fmt.Errorf("validate HTTP load balancer target: %w", err)
@@ -93,6 +94,20 @@ func (l LoadBalancedWebService) Validate() error {
 	return nil
 }
 
+func (d DeploymentConfiguration) Validate() error {
+	if d.isEmpty() {
+		return nil
+	}
+	for _, validStrategy := range ecsRollingUpdateStrategies {
+		if strings.EqualFold(aws.StringValue(d.Rolling), validStrategy) {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid rolling deployment strategy %s, must be one of %s",
+		aws.StringValue(d.Rolling),
+		english.WordSeries(ecsRollingUpdateStrategies, "or"))
+}
+
 // Validate returns nil if LoadBalancedWebServiceConfig is configured correctly.
 func (l LoadBalancedWebServiceConfig) Validate() error {
 	var err error
@@ -101,7 +116,7 @@ func (l LoadBalancedWebServiceConfig) Validate() error {
 			missingFields: []string{"http", "nlb"},
 		}
 	}
-	if l.RoutingRule.Disabled() && (l.Count.AdvancedCount.Requests != nil || l.Count.AdvancedCount.ResponseTime != nil) {
+	if l.RoutingRule.Disabled() && (!l.Count.AdvancedCount.Requests.IsEmpty() || !l.Count.AdvancedCount.ResponseTime.IsEmpty()) {
 		return errors.New(`scaling based on "nlb" requests or response time is not supported`)
 	}
 	if err = l.ImageConfig.Validate(); err != nil {
@@ -137,8 +152,7 @@ func (l LoadBalancedWebServiceConfig) Validate() error {
 	}
 	if l.TaskConfig.IsWindows() {
 		if err = validateWindows(validateWindowsOpts{
-			execEnabled: aws.BoolValue(l.ExecuteCommand.Enable),
-			efsVolumes:  l.Storage.Volumes,
+			efsVolumes: l.Storage.Volumes,
 		}); err != nil {
 			return fmt.Errorf("validate Windows: %w", err)
 		}
@@ -154,12 +168,18 @@ func (l LoadBalancedWebServiceConfig) Validate() error {
 	if err = l.NLBConfig.Validate(); err != nil {
 		return fmt.Errorf(`validate "nlb": %w`, err)
 	}
+	if err = l.DeployConfig.Validate(); err != nil {
+		return fmt.Errorf(`validate "deployment": %w`, err)
+	}
 	return nil
 }
 
 // Validate returns nil if BackendService is configured correctly.
 func (b BackendService) Validate() error {
 	var err error
+	if err = b.DeployConfig.Validate(); err != nil {
+		return fmt.Errorf(`validate "deployment": %w`, err)
+	}
 	if err = b.BackendServiceConfig.Validate(); err != nil {
 		return err
 	}
@@ -186,6 +206,15 @@ func (b BackendServiceConfig) Validate() error {
 	if err = b.ImageOverride.Validate(); err != nil {
 		return err
 	}
+	if err = b.RoutingRule.Validate(); err != nil {
+		return fmt.Errorf(`validate "http": %w`, err)
+	}
+	if b.RoutingRule.IsEmpty() && (!b.Count.AdvancedCount.Requests.IsEmpty() || !b.Count.AdvancedCount.ResponseTime.IsEmpty()) {
+		return &errFieldMustBeSpecified{
+			missingField:      "http",
+			conditionalFields: []string{"count.requests", "count.response_time"},
+		}
+	}
 	if err = b.TaskConfig.Validate(); err != nil {
 		return err
 	}
@@ -210,8 +239,7 @@ func (b BackendServiceConfig) Validate() error {
 	}
 	if b.TaskConfig.IsWindows() {
 		if err = validateWindows(validateWindowsOpts{
-			execEnabled: aws.BoolValue(b.ExecuteCommand.Enable),
-			efsVolumes:  b.Storage.Volumes,
+			efsVolumes: b.Storage.Volumes,
 		}); err != nil {
 			return fmt.Errorf("validate Windows: %w", err)
 		}
@@ -253,6 +281,11 @@ func (r RequestDrivenWebServiceConfig) Validate() error {
 	if err = r.Network.Validate(); err != nil {
 		return fmt.Errorf(`validate "network": %w`, err)
 	}
+	if r.Network.VPC.Placement.PlacementString != nil &&
+		*r.Network.VPC.Placement.PlacementString != PrivateSubnetPlacement {
+		return fmt.Errorf(`placement %q is not supported for %s`,
+			*r.Network.VPC.Placement.PlacementString, RequestDrivenWebServiceType)
+	}
 	if err = r.Observability.Validate(); err != nil {
 		return fmt.Errorf(`validate "observability": %w`, err)
 	}
@@ -262,6 +295,9 @@ func (r RequestDrivenWebServiceConfig) Validate() error {
 // Validate returns nil if WorkerService is configured correctly.
 func (w WorkerService) Validate() error {
 	var err error
+	if err = w.DeployConfig.Validate(); err != nil {
+		return fmt.Errorf(`validate "deployment": %w`, err)
+	}
 	if err = w.WorkerServiceConfig.Validate(); err != nil {
 		return err
 	}
@@ -315,8 +351,7 @@ func (w WorkerServiceConfig) Validate() error {
 	}
 	if w.TaskConfig.IsWindows() {
 		if err = validateWindows(validateWindowsOpts{
-			execEnabled: aws.BoolValue(w.ExecuteCommand.Enable),
-			efsVolumes:  w.Storage.Volumes,
+			efsVolumes: w.Storage.Volumes,
 		}); err != nil {
 			return fmt.Errorf(`validate Windows: %w`, err)
 		}
@@ -391,8 +426,7 @@ func (s ScheduledJobConfig) Validate() error {
 	}
 	if s.TaskConfig.IsWindows() {
 		if err = validateWindows(validateWindowsOpts{
-			execEnabled: aws.BoolValue(s.ExecuteCommand.Enable),
-			efsVolumes:  s.Storage.Volumes,
+			efsVolumes: s.Storage.Volumes,
 		}); err != nil {
 			return fmt.Errorf(`validate Windows: %w`, err)
 		}
@@ -412,6 +446,31 @@ func (s ScheduledJobConfig) Validate() error {
 func (p Pipeline) Validate() error {
 	if len(p.Name) > 100 {
 		return fmt.Errorf(`pipeline name '%s' must be shorter than 100 characters`, p.Name)
+	}
+	for _, stg := range p.Stages {
+		if err := stg.Deployments.Validate(); err != nil {
+			return fmt.Errorf(`validate "deployments" for pipeline stage %s: %w`, stg.Name, err)
+		}
+	}
+	return nil
+}
+
+// Validate returns nil if deployments are configured correctly.
+func (d Deployments) Validate() error {
+	names := make(map[string]bool)
+	for name := range d {
+		names[name] = true
+	}
+
+	for name, conf := range d {
+		if conf == nil {
+			continue
+		}
+		for _, dependency := range conf.DependsOn {
+			if _, ok := names[dependency]; !ok {
+				return fmt.Errorf("dependency deployment named '%s' of '%s' does not exist", dependency, name)
+			}
+		}
 	}
 	return nil
 }
@@ -564,24 +623,26 @@ func (CommandOverride) Validate() error {
 
 // Validate returns nil if RoutingRuleConfigOrBool is configured correctly.
 func (r RoutingRuleConfigOrBool) Validate() error {
-	if aws.BoolValue(r.Enabled) {
+	if r.Disabled() {
+		return nil
+	}
+	if r.Path == nil {
 		return &errFieldMustBeSpecified{
 			missingField: "path",
 		}
-	}
-	if r.Enabled != nil {
-		return nil
 	}
 	return r.RoutingRuleConfiguration.Validate()
 }
 
 // Validate returns nil if RoutingRuleConfiguration is configured correctly.
 func (r RoutingRuleConfiguration) Validate() error {
-	var err error
-	if err = r.HealthCheck.Validate(); err != nil {
+	if r.IsEmpty() {
+		return nil
+	}
+	if err := r.HealthCheck.Validate(); err != nil {
 		return fmt.Errorf(`validate "healthcheck": %w`, err)
 	}
-	if err = r.Alias.Validate(); err != nil {
+	if err := r.Alias.Validate(); err != nil {
 		return fmt.Errorf(`validate "alias": %w`, err)
 	}
 	if r.TargetContainer != nil && r.TargetContainerCamelCase != nil {
@@ -591,7 +652,7 @@ func (r RoutingRuleConfiguration) Validate() error {
 		}
 	}
 	for ind, ip := range r.AllowedSourceIps {
-		if err = ip.Validate(); err != nil {
+		if err := ip.Validate(); err != nil {
 			return fmt.Errorf(`validate "allowed_source_ips[%d]": %w`, ind, err)
 		}
 	}
@@ -603,6 +664,12 @@ func (r RoutingRuleConfiguration) Validate() error {
 	if r.Path == nil {
 		return &errFieldMustBeSpecified{
 			missingField: "path",
+		}
+	}
+	if r.HostedZone != nil && r.Alias.IsEmpty() {
+		return &errFieldMustBeSpecified{
+			missingField:      "alias",
+			conditionalFields: []string{"hosted_zone"},
 		}
 	}
 	return nil
@@ -633,7 +700,33 @@ func (h NLBHealthCheckArgs) Validate() error {
 }
 
 // Validate returns nil if Alias is configured correctly.
-func (Alias) Validate() error {
+func (a Alias) Validate() error {
+	if a.IsEmpty() {
+		return nil
+	}
+	if err := a.StringSliceOrString.Validate(); err != nil {
+		return err
+	}
+	for _, alias := range a.AdvancedAliases {
+		if err := alias.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Validate returns nil if AdvancedAlias is configured correctly.
+func (a AdvancedAlias) Validate() error {
+	if a.Alias == nil {
+		return &errFieldMustBeSpecified{
+			missingField: "name",
+		}
+	}
+	return nil
+}
+
+// Validate is a no-op for stringSliceOrString.
+func (stringSliceOrString) Validate() error {
 	return nil
 }
 
@@ -663,6 +756,13 @@ func (c NetworkLoadBalancerConfiguration) Validate() error {
 	}
 	if err := c.Aliases.Validate(); err != nil {
 		return fmt.Errorf(`validate "alias": %w`, err)
+	}
+	if !c.Aliases.IsEmpty() {
+		for _, advancedAlias := range c.Aliases.AdvancedAliases {
+			if advancedAlias.HostedZone != nil {
+				return fmt.Errorf(`"hosted_zone" is not supported for Network Load Balancer`)
+			}
+		}
 	}
 	return nil
 }
@@ -775,6 +875,15 @@ func (a AdvancedCount) Validate() error {
 	if len(a.validScalingFields()) == 0 {
 		return fmt.Errorf("cannot have autoscaling options for workloads of type '%s'", a.workloadType)
 	}
+
+	// Validate if incorrect autoscaling fields are set
+	if fields := a.getInvalidFieldsSet(); fields != nil {
+		return &errInvalidAutoscalingFieldsWithWkldType{
+			invalidFields: fields,
+			workloadType:  a.workloadType,
+		}
+	}
+
 	// Validate spot and remaining autoscaling fields.
 	if a.Spot != nil && a.hasAutoscaling() {
 		return &errFieldMutualExclusive{
@@ -800,20 +909,25 @@ func (a AdvancedCount) Validate() error {
 		}
 	}
 
+	// Validate combinations with cooldown
+	if !a.Cooldown.IsEmpty() && !a.hasScalingFieldsSet() {
+		return &errAtLeastOneFieldMustBeSpecified{
+			missingFields:    a.validScalingFields(),
+			conditionalField: "cooldown",
+		}
+	}
+
 	// Validate individual custom autoscaling options.
 	if err := a.QueueScaling.Validate(); err != nil {
 		return fmt.Errorf(`validate "queue_delay": %w`, err)
 	}
-	if a.CPU != nil {
-		if err := a.CPU.Validate(); err != nil {
-			return fmt.Errorf(`validate "cpu_percentage": %w`, err)
-		}
+	if err := a.CPU.Validate(); err != nil {
+		return fmt.Errorf(`validate "cpu_percentage": %w`, err)
 	}
-	if a.Memory != nil {
-		if err := a.Memory.Validate(); err != nil {
-			return fmt.Errorf(`validate "memory_percentage": %w`, err)
-		}
+	if err := a.Memory.Validate(); err != nil {
+		return fmt.Errorf(`validate "memory_percentage": %w`, err)
 	}
+
 	return nil
 }
 
@@ -825,18 +939,53 @@ func (p Percentage) Validate() error {
 	return nil
 }
 
+// Validate returns nil if ScalingConfigOrT is configured correctly.
+func (r ScalingConfigOrT[_]) Validate() error {
+	if r.IsEmpty() {
+		return nil
+	}
+	if r.Value != nil {
+		switch any(r.Value).(type) {
+		case *Percentage:
+			return any(r.Value).(*Percentage).Validate()
+		default:
+			return nil
+		}
+	}
+	return r.ScalingConfig.Validate()
+}
+
+// Validate returns nil if AdvancedScalingConfig is configured correctly.
+func (r AdvancedScalingConfig[_]) Validate() error {
+	if r.IsEmpty() {
+		return nil
+	}
+	switch any(r.Value).(type) {
+	case *Percentage:
+		if err := any(r.Value).(*Percentage).Validate(); err != nil {
+			return err
+		}
+	}
+	return r.Cooldown.Validate()
+}
+
+// Validation is a no-op for Cooldown.
+func (c Cooldown) Validate() error {
+	return nil
+}
+
 // Validate returns nil if QueueScaling is configured correctly.
 func (qs QueueScaling) Validate() error {
 	if qs.IsEmpty() {
 		return nil
 	}
-	if qs.AcceptableLatency == nil {
+	if qs.AcceptableLatency == nil && qs.AvgProcessingTime != nil {
 		return &errFieldMustBeSpecified{
 			missingField:      "acceptable_latency",
 			conditionalFields: []string{"msg_processing_time"},
 		}
 	}
-	if qs.AvgProcessingTime == nil {
+	if qs.AvgProcessingTime == nil && qs.AcceptableLatency != nil {
 		return &errFieldMustBeSpecified{
 			missingField:      "msg_processing_time",
 			conditionalFields: []string{"acceptable_latency"},
@@ -852,7 +1001,7 @@ func (qs QueueScaling) Validate() error {
 	if process > latency {
 		return errors.New(`"msg_processing_time" cannot be longer than "acceptable_latency"`)
 	}
-	return nil
+	return qs.Cooldown.Validate()
 }
 
 // Validate returns nil if Range is configured correctly.
@@ -1091,10 +1240,8 @@ func (v rdwsVpcConfig) Validate() error {
 	if v.isEmpty() {
 		return nil
 	}
-	if v.Placement != nil {
-		if err := v.Placement.Validate(); err != nil {
-			return fmt.Errorf(`validate "placement": %w`, err)
-		}
+	if err := v.Placement.Validate(); err != nil {
+		return fmt.Errorf(`validate "placement": %w`, err)
 	}
 	return nil
 }
@@ -1104,27 +1251,33 @@ func (v vpcConfig) Validate() error {
 	if v.isEmpty() {
 		return nil
 	}
-	if v.Placement != nil {
-		if err := v.Placement.Validate(); err != nil {
-			return fmt.Errorf(`validate "placement": %w`, err)
-		}
+	if err := v.Placement.Validate(); err != nil {
+		return fmt.Errorf(`validate "placement": %w`, err)
+	}
+	if err := v.SecurityGroups.Validate(); err != nil {
+		return fmt.Errorf(`validate "security_groups": %w`, err)
 	}
 	return nil
 }
 
-// Validate returns nil if RequestDrivenWebServicePlacement is configured correctly.
-func (p RequestDrivenWebServicePlacement) Validate() error {
-	if err := (Placement)(p).Validate(); err != nil {
-		return err
-	}
-	if string(p) == string(PrivateSubnetPlacement) {
+// Validate returns nil if PlacementArgOrString is configured correctly.
+func (p PlacementArgOrString) Validate() error {
+	if p.IsEmpty() {
 		return nil
 	}
-	return fmt.Errorf(`placement "%s" is not supported for %s`, string(p), RequestDrivenWebServiceType)
+	if p.PlacementString != nil {
+		return p.PlacementString.Validate()
+	}
+	return p.PlacementArgs.Validate()
 }
 
-// Validate returns nil if Placement is configured correctly.
-func (p Placement) Validate() error {
+// Validate is a no-op for PlacementArgs.
+func (p PlacementArgs) Validate() error {
+	return nil
+}
+
+// Validate returns nil if PlacementString is configured correctly.
+func (p PlacementString) Validate() error {
 	if string(p) == "" {
 		return fmt.Errorf(`"placement" cannot be empty`)
 	}
@@ -1134,6 +1287,19 @@ func (p Placement) Validate() error {
 		}
 	}
 	return fmt.Errorf(`"placement" %s must be one of %s`, string(p), strings.Join(subnetPlacements, ", "))
+}
+
+// Validate is a no-op for SecurityGroupsIDsOrConfig.
+func (s SecurityGroupsIDsOrConfig) Validate() error {
+	if s.isEmpty() {
+		return nil
+	}
+	return s.AdvancedConfig.Validate()
+}
+
+// Validate is a no-op for SecurityGroupsConfig.
+func (SecurityGroupsConfig) Validate() error {
+	return nil
 }
 
 // Validate returns nil if AppRunnerInstanceConfig is configured correctly.
@@ -1303,8 +1469,7 @@ type validateTargetContainerOpts struct {
 }
 
 type validateWindowsOpts struct {
-	execEnabled bool
-	efsVolumes  map[string]*Volume
+	efsVolumes map[string]*Volume
 }
 
 type validateARMOpts struct {
@@ -1386,19 +1551,19 @@ func validateNoCircularDependencies(deps map[string]containerDependency) error {
 	if len(cycle) == 1 {
 		return fmt.Errorf("container %s cannot depend on itself", cycle[0])
 	}
-	// Stablize unit tests.
+	// Stabilize unit tests.
 	sort.SliceStable(cycle, func(i, j int) bool { return cycle[i] < cycle[j] })
 	return fmt.Errorf("circular container dependency chain includes the following containers: %s", cycle)
 }
 
-func buildDependencyGraph(deps map[string]containerDependency) (*graph.Graph, error) {
-	dependencyGraph := graph.New()
+func buildDependencyGraph(deps map[string]containerDependency) (*graph.Graph[string], error) {
+	dependencyGraph := graph.New[string]()
 	for name, containerDep := range deps {
 		for dep := range containerDep.dependsOn {
 			if _, ok := deps[dep]; !ok {
 				return nil, fmt.Errorf("container %s does not exist", dep)
 			}
-			dependencyGraph.Add(graph.Edge{
+			dependencyGraph.Add(graph.Edge[string]{
 				From: name,
 				To:   dep,
 			})
@@ -1449,9 +1614,6 @@ func isValidSubSvcName(name string) bool {
 }
 
 func validateWindows(opts validateWindowsOpts) error {
-	if opts.execEnabled {
-		return errors.New(`'exec' is not supported when deploying a Windows container`)
-	}
 	for _, volume := range opts.efsVolumes {
 		if !volume.EmptyVolume() {
 			return errors.New(`'EFS' is not supported when deploying a Windows container`)

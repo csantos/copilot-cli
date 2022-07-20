@@ -5,19 +5,11 @@
 package selector
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 
 	"github.com/aws/copilot-cli/internal/pkg/aws/ec2"
-)
-
-var (
-	// ErrVPCNotFound is returned when no existing VPCs are found.
-	ErrVPCNotFound = errors.New("no existing VPCs found")
-	// ErrSubnetsNotFound is returned when no existing subnets are found.
-	ErrSubnetsNotFound = errors.New("no existing subnets found")
 )
 
 // VPCSubnetLister list VPCs and subnets.
@@ -28,12 +20,12 @@ type VPCSubnetLister interface {
 
 // EC2Select is a selector for Ec2 resources.
 type EC2Select struct {
-	prompt Prompter
+	prompt prompter
 	ec2Svc VPCSubnetLister
 }
 
 // NewEC2Select returns a new selector that chooses Ec2 resources.
-func NewEC2Select(prompt Prompter, ec2Client VPCSubnetLister) *EC2Select {
+func NewEC2Select(prompt prompter, ec2Client VPCSubnetLister) *EC2Select {
 	return &EC2Select{
 		prompt: prompt,
 		ec2Svc: ec2Client,
