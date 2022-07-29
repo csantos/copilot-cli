@@ -182,10 +182,6 @@ type logEventsWriter interface {
 	WriteLogEvents(opts logging.WriteLogEventsOpts) error
 }
 
-type templater interface {
-	Template() (string, error)
-}
-
 type execRunner interface {
 	Run(name string, args []string, options ...exec.CmdOption) error
 }
@@ -251,10 +247,18 @@ type wsPipelineManifestReader interface {
 	ReadPipelineManifest(path string) (*manifest.Pipeline, error)
 }
 
+type relPath interface {
+	// Rel returns the path relative from the object's root path to the target path.
+	//
+	// Unlike filepath.Rel, the input path is allowed to be either relative to the
+	// current working directory or absolute.
+	Rel(path string) (string, error)
+}
+
 type wsPipelineIniter interface {
+	relPath
 	WritePipelineBuildspec(marshaler encoding.BinaryMarshaler, name string) (string, error)
 	WritePipelineManifest(marshaler encoding.BinaryMarshaler, name string) (string, error)
-	Rel(path string) (string, error)
 	ListPipelines() ([]workspace.PipelineManifest, error)
 }
 
@@ -302,7 +306,7 @@ type wsEnvironmentReader interface {
 
 type wsPipelineReader interface {
 	wsPipelineGetter
-	Rel(path string) (string, error)
+	relPath
 }
 
 type wsPipelineGetter interface {
@@ -625,10 +629,11 @@ type workloadDeployer interface {
 	IsServiceAvailableInRegion(region string) (bool, error)
 }
 
-type workloadTemplateGenerator interface {
+type workloadStackGenerator interface {
 	UploadArtifacts() (*clideploy.UploadArtifactsOutput, error)
 	GenerateCloudFormationTemplate(in *clideploy.GenerateCloudFormationTemplateInput) (
 		*clideploy.GenerateCloudFormationTemplateOutput, error)
+	AddonsTemplate() (string, error)
 }
 
 type runner interface {
